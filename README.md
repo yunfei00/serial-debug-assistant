@@ -1,4 +1,5 @@
-﻿# Serial Debug Assistant
+# serial-debug-assistant
+# Serial Debug Assistant
 
 基于 Python 3.11、PySide6、pyserial 开发的桌面串口调试助手。
 
