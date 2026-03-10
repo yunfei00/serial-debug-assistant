@@ -10,7 +10,7 @@ from serial.tools import list_ports
 class SerialReadThread(QThread):
     """后台读取串口数据，避免阻塞界面。"""
 
-    data_received = Signal(str)
+    data_received = Signal(bytes)
     error_occurred = Signal(str)
 
     def __init__(self, serial_port: serial.Serial) -> None:
@@ -26,8 +26,7 @@ class SerialReadThread(QThread):
 
                 chunk = self._serial_port.read(self._serial_port.in_waiting or 1)
                 if chunk:
-                    text = chunk.decode("utf-8", errors="replace")
-                    self.data_received.emit(text)
+                    self.data_received.emit(chunk)
             except serial.SerialException as exc:
                 if self._running:
                     self.error_occurred.emit(f"串口读取失败：{exc}")
@@ -45,7 +44,7 @@ class SerialReadThread(QThread):
 class SerialService(QObject):
     """串口服务，负责串口操作与状态管理。"""
 
-    data_received = Signal(str)
+    data_received = Signal(bytes)
     error_occurred = Signal(str)
     connection_changed = Signal(bool, str)
 
@@ -82,7 +81,7 @@ class SerialService(QObject):
 
         self._serial_port = serial_port
         self._read_thread = SerialReadThread(serial_port)
-        self._read_thread.data_received.connect(self.data_received)
+        self._read_thread.data_received.connect(self.data_received.emit)
         self._read_thread.error_occurred.connect(self._handle_thread_error)
         self._read_thread.start()
         self.connection_changed.emit(True, f"已打开串口：{port_name}")
@@ -109,20 +108,24 @@ class SerialService(QObject):
         message = f"已关闭串口：{port_name}" if port_name else "串口已关闭"
         self.connection_changed.emit(False, message)
 
-    def send_text(self, text: str) -> None:
-        """发送文本数据。"""
+    def send_bytes(self, data: bytes) -> None:
+        """发送字节数据。"""
         if not self.is_open() or self._serial_port is None:
             raise RuntimeError("串口未打开")
 
-        if not text:
+        if not data:
             raise ValueError("发送内容不能为空")
 
         try:
-            self._serial_port.write(text.encode("utf-8"))
+            self._serial_port.write(data)
         except serial.SerialTimeoutException as exc:
             raise RuntimeError(f"发送超时：{exc}") from exc
         except serial.SerialException as exc:
             raise RuntimeError(f"发送失败：{exc}") from exc
+
+    def send_text(self, text: str) -> None:
+        """发送文本数据。"""
+        self.send_bytes(text.encode("utf-8"))
 
     def dispose(self) -> None:
         """释放资源，供界面退出时调用。"""
