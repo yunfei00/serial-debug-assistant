@@ -6,6 +6,8 @@ import serial
 from PySide6.QtCore import QObject, QThread, Signal
 from serial.tools import list_ports
 
+from app.core.models import SerialConfig, SerialPortInfo
+
 
 class SerialReadThread(QThread):
     """后台读取串口数据，避免阻塞界面。"""
@@ -48,33 +50,60 @@ class SerialService(QObject):
     error_occurred = Signal(str)
     connection_changed = Signal(bool, str)
 
+    BYTE_SIZE_MAP = {
+        5: serial.FIVEBITS,
+        6: serial.SIXBITS,
+        7: serial.SEVENBITS,
+        8: serial.EIGHTBITS,
+    }
+    PARITY_MAP = {
+        "N": serial.PARITY_NONE,
+        "E": serial.PARITY_EVEN,
+        "O": serial.PARITY_ODD,
+    }
+    STOP_BITS_MAP = {
+        1.0: serial.STOPBITS_ONE,
+        1.5: serial.STOPBITS_ONE_POINT_FIVE,
+        2.0: serial.STOPBITS_TWO,
+    }
+
     def __init__(self) -> None:
         super().__init__()
         self._serial_port: Optional[serial.Serial] = None
         self._read_thread: Optional[SerialReadThread] = None
 
-    def list_ports(self) -> list[str]:
+    def list_ports(self) -> list[SerialPortInfo]:
         """枚举系统串口列表。"""
         ports = list_ports.comports()
-        return [port.device for port in ports]
+        return [
+            SerialPortInfo(
+                device=port.device,
+                description=port.description or "",
+                manufacturer=port.manufacturer or "",
+                hwid=port.hwid or "",
+            )
+            for port in ports
+        ]
 
     def is_open(self) -> bool:
         return bool(self._serial_port and self._serial_port.is_open)
 
-    def open_port(self, port_name: str, baudrate: int) -> None:
+    def open_port(self, config_or_port_name: SerialConfig | str, baudrate: int | None = None) -> None:
         """打开串口并启动读取线程。"""
         if self.is_open():
             raise RuntimeError("串口已经处于打开状态")
 
-        if not port_name:
-            raise ValueError("请选择串口")
+        config = self._normalize_config(config_or_port_name, baudrate)
 
         try:
             serial_port = serial.Serial(
-                port=port_name,
-                baudrate=baudrate,
-                timeout=0.1,
-                write_timeout=1,
+                port=config.port_name,
+                baudrate=config.baudrate,
+                bytesize=self._get_bytesize(config.data_bits),
+                parity=self._get_parity(config.parity),
+                stopbits=self._get_stopbits(config.stop_bits),
+                timeout=config.timeout,
+                write_timeout=config.write_timeout,
             )
         except serial.SerialException as exc:
             raise RuntimeError(f"打开串口失败：{exc}") from exc
@@ -84,7 +113,10 @@ class SerialService(QObject):
         self._read_thread.data_received.connect(self.data_received.emit)
         self._read_thread.error_occurred.connect(self._handle_thread_error)
         self._read_thread.start()
-        self.connection_changed.emit(True, f"已打开串口：{port_name}")
+        self.connection_changed.emit(
+            True,
+            f"已打开串口：{config.port_name}，{config.baudrate} bps，{config.data_bits}{config.parity}{self._format_stop_bits(config.stop_bits)}",
+        )
 
     def close_port(self) -> None:
         """关闭串口并停止后台线程。"""
@@ -142,3 +174,42 @@ class SerialService(QObject):
                 self.close_port()
             except RuntimeError as exc:
                 self.error_occurred.emit(str(exc))
+
+    def _normalize_config(self, config_or_port_name: SerialConfig | str, baudrate: int | None) -> SerialConfig:
+        if isinstance(config_or_port_name, SerialConfig):
+            config = config_or_port_name
+        else:
+            if not config_or_port_name:
+                raise ValueError("请选择串口")
+            if baudrate is None:
+                raise ValueError("缺少波特率配置")
+            config = SerialConfig(port_name=config_or_port_name, baudrate=baudrate)
+
+        if not config.port_name:
+            raise ValueError("请选择串口")
+
+        return config
+
+    def _get_bytesize(self, data_bits: int) -> int:
+        try:
+            return self.BYTE_SIZE_MAP[data_bits]
+        except KeyError as exc:
+            raise ValueError(f"不支持的数据位：{data_bits}") from exc
+
+    def _get_parity(self, parity: str) -> str:
+        try:
+            return self.PARITY_MAP[parity]
+        except KeyError as exc:
+            raise ValueError(f"不支持的校验位：{parity}") from exc
+
+    def _get_stopbits(self, stop_bits: float) -> float:
+        try:
+            return self.STOP_BITS_MAP[stop_bits]
+        except KeyError as exc:
+            raise ValueError(f"不支持的停止位：{stop_bits}") from exc
+
+    def _format_stop_bits(self, stop_bits: float) -> str:
+        stop_bits_value = float(stop_bits)
+        if stop_bits_value.is_integer():
+            return str(int(stop_bits_value))
+        return str(stop_bits_value)

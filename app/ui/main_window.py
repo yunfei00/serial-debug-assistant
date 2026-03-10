@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core.models import SerialConfig, SerialPortInfo
 from app.services.serial_service import SerialService
 
 
@@ -27,24 +28,31 @@ class MainWindow(QMainWindow):
     """主窗口。"""
 
     BAUDRATES = ["9600", "19200", "38400", "57600", "115200"]
+    DATA_BITS = ["5", "6", "7", "8"]
+    PARITY_OPTIONS = [("无校验", "N"), ("奇校验", "O"), ("偶校验", "E")]
+    STOP_BITS_OPTIONS = [("1", "1.0"), ("1.5", "1.5"), ("2", "2.0")]
 
     def __init__(self) -> None:
         super().__init__()
         self.serial_service = SerialService()
         self.auto_send_timer = QTimer(self)
+        self._available_ports: list[SerialPortInfo] = []
         self._received_buffer = bytearray()
         self._send_history: list[str] = []
+        self._send_byte_count = 0
+        self._receive_byte_count = 0
 
         self._setup_ui()
         self._bind_signals()
         self.refresh_ports()
         self._refresh_history_combo()
+        self._update_transfer_stats()
         self._update_ui_state(False)
         self._apply_wrap_mode(self.wrap_checkbox.isChecked())
 
     def _setup_ui(self) -> None:
         self.setWindowTitle("串口调试助手")
-        self.resize(900, 620)
+        self.resize(980, 680)
 
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
@@ -57,6 +65,7 @@ class MainWindow(QMainWindow):
 
         connection_layout.addWidget(QLabel("串口："))
         self.port_combo = QComboBox()
+        self.port_combo.setMinimumWidth(220)
         connection_layout.addWidget(self.port_combo, 2)
 
         self.refresh_button = QPushButton("刷新")
@@ -68,11 +77,43 @@ class MainWindow(QMainWindow):
         self.baudrate_combo.setCurrentText("115200")
         connection_layout.addWidget(self.baudrate_combo)
 
+        connection_layout.addWidget(QLabel("数据位："))
+        self.data_bits_combo = QComboBox()
+        self.data_bits_combo.addItems(self.DATA_BITS)
+        self.data_bits_combo.setCurrentText("8")
+        connection_layout.addWidget(self.data_bits_combo)
+
+        connection_layout.addWidget(QLabel("校验位："))
+        self.parity_combo = QComboBox()
+        for label, value in self.PARITY_OPTIONS:
+            self.parity_combo.addItem(label, value)
+        connection_layout.addWidget(self.parity_combo)
+
+        connection_layout.addWidget(QLabel("停止位："))
+        self.stop_bits_combo = QComboBox()
+        for label, value in self.STOP_BITS_OPTIONS:
+            self.stop_bits_combo.addItem(label, value)
+        connection_layout.addWidget(self.stop_bits_combo)
+
         self.open_button = QPushButton("打开串口")
         connection_layout.addWidget(self.open_button)
 
         self.close_button = QPushButton("关闭串口")
         connection_layout.addWidget(self.close_button)
+
+        info_layout = QHBoxLayout()
+        main_layout.addLayout(info_layout)
+
+        info_layout.addWidget(QLabel("端口信息："))
+        self.port_info_label = QLabel("未发现可用串口")
+        self.port_info_label.setWordWrap(True)
+        info_layout.addWidget(self.port_info_label, 1)
+
+        self.stats_label = QLabel("发送：0 字节  接收：0 字节")
+        info_layout.addWidget(self.stats_label)
+
+        self.reset_stats_button = QPushButton("清零统计")
+        info_layout.addWidget(self.reset_stats_button)
 
         send_layout = QHBoxLayout()
         main_layout.addLayout(send_layout)
@@ -93,7 +134,7 @@ class MainWindow(QMainWindow):
 
         send_option_layout.addWidget(QLabel("发送历史："))
         self.history_combo = QComboBox()
-        self.history_combo.setMinimumWidth(260)
+        self.history_combo.setMinimumWidth(280)
         send_option_layout.addWidget(self.history_combo, 1)
         send_option_layout.addStretch()
 
@@ -145,8 +186,10 @@ class MainWindow(QMainWindow):
         self.send_button.clicked.connect(lambda: self.send_text())
         self.clear_button.clicked.connect(lambda: self.clear_receive_area())
         self.save_log_button.clicked.connect(lambda: self.save_receive_log())
+        self.reset_stats_button.clicked.connect(lambda: self.reset_transfer_stats())
         self.send_input.returnPressed.connect(self.send_text)
 
+        self.port_combo.currentIndexChanged.connect(self._on_port_changed)
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
         self.wrap_checkbox.toggled.connect(self._apply_wrap_mode)
@@ -160,24 +203,30 @@ class MainWindow(QMainWindow):
         self.serial_service.connection_changed.connect(self.on_connection_changed)
 
     def refresh_ports(self) -> None:
-        current_port = self.port_combo.currentText()
-        ports = self.serial_service.list_ports()
+        current_port = self._current_port_name()
+        self._available_ports = self.serial_service.list_ports()
 
+        self.port_combo.blockSignals(True)
         self.port_combo.clear()
-        self.port_combo.addItems(ports)
+        for port_info in self._available_ports:
+            self.port_combo.addItem(port_info.display_name, port_info.device)
+        self.port_combo.blockSignals(False)
 
-        if current_port and current_port in ports:
-            self.port_combo.setCurrentText(current_port)
+        if current_port:
+            index = self.port_combo.findData(current_port)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
 
-        message = f"已刷新，共发现 {len(ports)} 个串口" if ports else "未发现可用串口"
+        self._update_port_info()
+        count = len(self._available_ports)
+        message = f"已刷新，共发现 {count} 个串口" if count else "未发现可用串口"
         self.statusBar().showMessage(message)
 
     def open_port(self) -> None:
-        port_name = self.port_combo.currentText().strip()
-        baudrate = int(self.baudrate_combo.currentText())
-
         try:
-            self.serial_service.open_port(port_name, baudrate)
+            config = self._build_serial_config()
+            self.serial_service.open_port(config)
+            self.reset_transfer_stats(show_message=False)
         except (RuntimeError, ValueError) as exc:
             self.show_error(str(exc))
 
@@ -204,13 +253,15 @@ class MainWindow(QMainWindow):
             self.show_error(str(exc))
             return False
 
+        self._send_byte_count += len(data)
+        self._update_transfer_stats()
         self._record_send_history(text)
 
         if clear_input:
             self.send_input.clear()
 
         if show_success:
-            self.statusBar().showMessage("发送成功")
+            self.statusBar().showMessage(f"发送成功，已发送 {len(data)} 字节")
 
         return True
 
@@ -233,6 +284,8 @@ class MainWindow(QMainWindow):
 
     def append_received_text(self, data: bytes) -> None:
         self._received_buffer.extend(data)
+        self._receive_byte_count += len(data)
+        self._update_transfer_stats()
         self._refresh_receive_display()
 
     def _refresh_receive_display(self) -> None:
@@ -308,6 +361,18 @@ class MainWindow(QMainWindow):
         if show_message:
             self.statusBar().showMessage("已停止定时发送")
 
+    def reset_transfer_stats(self, show_message: bool = True) -> None:
+        self._send_byte_count = 0
+        self._receive_byte_count = 0
+        self._update_transfer_stats()
+        if show_message:
+            self.statusBar().showMessage("收发统计已清零")
+
+    def _update_transfer_stats(self) -> None:
+        self.stats_label.setText(
+            f"发送：{self._send_byte_count} 字节  接收：{self._receive_byte_count} 字节"
+        )
+
     def _record_send_history(self, text: str) -> None:
         if self._send_history and self._send_history[0] == text:
             return
@@ -350,19 +415,65 @@ class MainWindow(QMainWindow):
         self.open_button.setEnabled(not is_open)
         self.close_button.setEnabled(is_open)
         self.refresh_button.setEnabled(not is_open)
+        self.port_combo.setEnabled(not is_open)
+        self.baudrate_combo.setEnabled(not is_open)
+        self.data_bits_combo.setEnabled(not is_open)
+        self.parity_combo.setEnabled(not is_open)
+        self.stop_bits_combo.setEnabled(not is_open)
+
         self.send_button.setEnabled(is_open and not is_auto_sending)
         self.send_input.setEnabled(is_open and not is_auto_sending)
         self.hex_send_checkbox.setEnabled(is_open and not is_auto_sending)
         self.start_timer_button.setEnabled(is_open and not is_auto_sending)
         self.stop_timer_button.setEnabled(is_auto_sending)
         self.interval_spin.setEnabled(is_open and not is_auto_sending)
-        self.port_combo.setEnabled(not is_open)
-        self.baudrate_combo.setEnabled(not is_open)
 
         if self._send_history:
             self.history_combo.setEnabled(not is_auto_sending)
         else:
             self.history_combo.setEnabled(False)
+
+    def _build_serial_config(self) -> SerialConfig:
+        port_name = self._current_port_name()
+        if not port_name:
+            raise ValueError("请选择串口")
+
+        return SerialConfig(
+            port_name=port_name,
+            baudrate=int(self.baudrate_combo.currentText()),
+            data_bits=int(self.data_bits_combo.currentText()),
+            parity=str(self.parity_combo.currentData()),
+            stop_bits=float(self.stop_bits_combo.currentData()),
+        )
+
+    def _current_port_name(self) -> str:
+        data = self.port_combo.currentData()
+        return str(data) if data else ""
+
+    def _on_port_changed(self, _index: int) -> None:
+        self._update_port_info()
+
+    def _update_port_info(self) -> None:
+        port_info = self._get_selected_port_info()
+        if port_info is None:
+            self.port_info_label.setText("未发现可用串口")
+            return
+
+        details = [f"设备：{port_info.device}"]
+        if port_info.description:
+            details.append(f"描述：{port_info.description}")
+        if port_info.manufacturer:
+            details.append(f"厂商：{port_info.manufacturer}")
+        if port_info.hwid:
+            details.append(f"硬件ID：{port_info.hwid}")
+        self.port_info_label.setText("  |  ".join(details))
+
+    def _get_selected_port_info(self) -> SerialPortInfo | None:
+        port_name = self._current_port_name()
+        for port_info in self._available_ports:
+            if port_info.device == port_name:
+                return port_info
+        return None
 
     def show_error(self, message: str) -> None:
         self.statusBar().showMessage(message)
