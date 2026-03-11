@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -37,13 +37,18 @@ class MainWindow(QMainWindow):
         ("LF(\\n)", "\n"),
         ("CRLF(\\r\\n)", "\r\n"),
     ]
+    SETTINGS_ORG = "serial-debug-assistant"
+    SETTINGS_APP = "main-window"
+    SETTINGS_LAST_SEND = "send/last_command"
 
     def __init__(self) -> None:
         super().__init__()
         self.serial_service = SerialService()
+        self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self.auto_send_timer = QTimer(self)
         self._available_ports: list[SerialPortInfo] = []
         self._received_buffer = bytearray()
+        self._log_entries: list[tuple[str, str, bytes, bool]] = []
         self._send_history: list[str] = []
         self._send_byte_count = 0
         self._receive_byte_count = 0
@@ -56,6 +61,7 @@ class MainWindow(QMainWindow):
         self._update_transfer_stats()
         self._update_ui_state(False)
         self._apply_wrap_mode(self.wrap_checkbox.isChecked())
+        self._load_persistent_state()
 
     def _setup_ui(self) -> None:
         self.setWindowTitle("串口调试助手")
@@ -257,7 +263,7 @@ class MainWindow(QMainWindow):
             self.show_error(str(exc))
 
     def send_text(self) -> None:
-        self._send_current_text(clear_input=True, show_success=True)
+        self._send_current_text(clear_input=False, show_success=True)
 
     def send_at_command(self) -> None:
         self.send_input.setText("AT")
@@ -281,6 +287,8 @@ class MainWindow(QMainWindow):
         self._pending_send_bytes += len(data)
         self._update_transfer_stats()
         self._record_send_history(text)
+        self.settings.setValue(self.SETTINGS_LAST_SEND, text)
+        self._append_log_entry("发送", data, is_hex=self.hex_send_checkbox.isChecked())
 
         if clear_input:
             self.send_input.clear()
@@ -312,6 +320,7 @@ class MainWindow(QMainWindow):
         self._received_buffer.extend(data)
         self._receive_byte_count += len(data)
         self._update_transfer_stats()
+        self._append_log_entry("接收", data, is_hex=False)
         self._refresh_receive_display()
 
     def on_data_sent(self, sent_bytes: int) -> None:
@@ -321,15 +330,16 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_receive_display(self) -> None:
-        if not self._received_buffer:
+        if not self._log_entries:
             self.receive_text.clear()
             return
 
-        raw_data = bytes(self._received_buffer)
-        if self.hex_display_checkbox.isChecked():
-            text = raw_data.hex(" ").upper()
-        else:
-            text = raw_data.decode("utf-8", errors="replace")
+        lines = []
+        for timestamp, direction, data, is_hex in self._log_entries:
+            use_hex = is_hex or (direction == "接收" and self.hex_display_checkbox.isChecked())
+            payload = data.hex(" ").upper() if use_hex else data.decode("utf-8", errors="replace")
+            lines.append(f"[{timestamp}] {direction}: {payload}")
+        text = "\n".join(lines)
 
         self.receive_text.setPlainText(text)
         self.receive_text.moveCursor(QTextCursor.MoveOperation.End)
@@ -340,11 +350,12 @@ class MainWindow(QMainWindow):
 
     def clear_receive_area(self) -> None:
         self._received_buffer.clear()
+        self._log_entries.clear()
         self.receive_text.clear()
         self.statusBar().showMessage("接收区已清空")
 
     def save_receive_log(self) -> None:
-        if not self._received_buffer:
+        if not self._log_entries:
             self.show_error("当前没有可保存的接收日志")
             return
 
@@ -435,6 +446,15 @@ class MainWindow(QMainWindow):
             return
 
         self.send_input.setText(self._send_history[index])
+
+    def _append_log_entry(self, direction: str, data: bytes, is_hex: bool) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        self._log_entries.append((timestamp, direction, data, is_hex))
+
+    def _load_persistent_state(self) -> None:
+        last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
+        if last_command:
+            self.send_input.setText(last_command)
 
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
