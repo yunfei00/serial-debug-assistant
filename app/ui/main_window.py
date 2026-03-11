@@ -27,6 +27,9 @@ from app.services.serial_service import SerialService
 class MainWindow(QMainWindow):
     """主窗口。"""
 
+    DIR_SEND = "send"
+    DIR_RECEIVE = "receive"
+
     BAUDRATES = ["9600", "19200", "38400", "57600", "115200"]
     DATA_BITS = ["5", "6", "7", "8"]
     PARITY_OPTIONS = [("无校验", "N"), ("奇校验", "O"), ("偶校验", "E")]
@@ -122,7 +125,7 @@ class MainWindow(QMainWindow):
         self.port_info_label.setWordWrap(True)
         info_layout.addWidget(self.port_info_label, 1)
 
-        self.stats_label = QLabel("发送：0 字节  接收：0 字节")
+        self.stats_label = QLabel("send: 0 bytes  receive: 0 bytes")
         info_layout.addWidget(self.stats_label)
 
         self.reset_stats_button = QPushButton("清零统计")
@@ -288,7 +291,7 @@ class MainWindow(QMainWindow):
         self._update_transfer_stats()
         self._record_send_history(text)
         self.settings.setValue(self.SETTINGS_LAST_SEND, text)
-        self._append_log_entry("发送", data, is_hex=self.hex_send_checkbox.isChecked())
+        self._append_log_entry(self.DIR_SEND, data, is_hex=self.hex_send_checkbox.isChecked())
 
         if clear_input:
             self.send_input.clear()
@@ -320,7 +323,7 @@ class MainWindow(QMainWindow):
         self._received_buffer.extend(data)
         self._receive_byte_count += len(data)
         self._update_transfer_stats()
-        self._append_log_entry("接收", data, is_hex=False)
+        self._append_log_entry(self.DIR_RECEIVE, data, is_hex=False)
         self._refresh_receive_display()
 
     def on_data_sent(self, sent_bytes: int) -> None:
@@ -336,7 +339,7 @@ class MainWindow(QMainWindow):
 
         lines = []
         for timestamp, direction, data, is_hex in self._log_entries:
-            use_hex = is_hex or (direction == "接收" and self.hex_display_checkbox.isChecked())
+            use_hex = is_hex or (direction == self.DIR_RECEIVE and self.hex_display_checkbox.isChecked())
             payload = data.hex(" ").upper() if use_hex else data.decode("utf-8", errors="replace")
             lines.append(f"[{timestamp}] {direction}: {payload}")
         text = "\n".join(lines)
@@ -414,7 +417,7 @@ class MainWindow(QMainWindow):
 
     def _update_transfer_stats(self) -> None:
         self.stats_label.setText(
-            f"发送：{self._send_byte_count} 字节  接收：{self._receive_byte_count} 字节"
+            f"send: {self._send_byte_count} bytes  receive: {self._receive_byte_count} bytes"
         )
 
     def _record_send_history(self, text: str) -> None:
@@ -448,8 +451,17 @@ class MainWindow(QMainWindow):
         self.send_input.setText(self._send_history[index])
 
     def _append_log_entry(self, direction: str, data: bytes, is_hex: bool) -> None:
+        processed_data = data
+        if not is_hex:
+            if direction == self.DIR_SEND:
+                processed_data = data.rstrip(b"\r\n")
+            elif direction == self.DIR_RECEIVE:
+                processed_data = data.strip(b"\r\n")
+                if not processed_data:
+                    return
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        self._log_entries.append((timestamp, direction, data, is_hex))
+        self._log_entries.append((timestamp, direction, processed_data, is_hex))
 
     def _load_persistent_state(self) -> None:
         last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
