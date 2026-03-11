@@ -41,6 +41,7 @@ class MainWindow(QMainWindow):
         self._send_history: list[str] = []
         self._send_byte_count = 0
         self._receive_byte_count = 0
+        self._pending_send_bytes = 0
 
         self._setup_ui()
         self._bind_signals()
@@ -199,6 +200,7 @@ class MainWindow(QMainWindow):
         self.auto_send_timer.timeout.connect(self.send_text_by_timer)
 
         self.serial_service.data_received.connect(self.append_received_text)
+        self.serial_service.data_sent.connect(self.on_data_sent)
         self.serial_service.error_occurred.connect(self.show_error)
         self.serial_service.connection_changed.connect(self.on_connection_changed)
 
@@ -254,6 +256,7 @@ class MainWindow(QMainWindow):
             return False
 
         self._send_byte_count += len(data)
+        self._pending_send_bytes += len(data)
         self._update_transfer_stats()
         self._record_send_history(text)
 
@@ -261,7 +264,7 @@ class MainWindow(QMainWindow):
             self.send_input.clear()
 
         if show_success:
-            self.statusBar().showMessage(f"发送成功，已发送 {len(data)} 字节")
+            self.statusBar().showMessage(f"发送请求已提交，等待串口发送 {len(data)} 字节")
 
         return True
 
@@ -287,6 +290,12 @@ class MainWindow(QMainWindow):
         self._receive_byte_count += len(data)
         self._update_transfer_stats()
         self._refresh_receive_display()
+
+    def on_data_sent(self, sent_bytes: int) -> None:
+        self._pending_send_bytes = max(0, self._pending_send_bytes - sent_bytes)
+        self.statusBar().showMessage(
+            f"串口已发送 {sent_bytes} 字节，待发送队列剩余 {self._pending_send_bytes} 字节"
+        )
 
     def _refresh_receive_display(self) -> None:
         if not self._received_buffer:
@@ -364,6 +373,7 @@ class MainWindow(QMainWindow):
     def reset_transfer_stats(self, show_message: bool = True) -> None:
         self._send_byte_count = 0
         self._receive_byte_count = 0
+        self._pending_send_bytes = 0
         self._update_transfer_stats()
         if show_message:
             self.statusBar().showMessage("收发统计已清零")
@@ -406,6 +416,7 @@ class MainWindow(QMainWindow):
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
             self.stop_auto_send(show_message=False)
+            self._pending_send_bytes = 0
         self._update_ui_state(is_open)
         self.statusBar().showMessage(message)
 
