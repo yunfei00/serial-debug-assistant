@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
     SETTINGS_ORG = "serial-debug-assistant"
     SETTINGS_APP = "main-window"
     SETTINGS_LAST_SEND = "send/last_command"
+    MULTI_LINE_SEND_INTERVAL_SECONDS = 0.2
 
     def __init__(self) -> None:
         super().__init__()
@@ -279,28 +280,36 @@ class MainWindow(QMainWindow):
         text = self.send_input.toPlainText()
 
         try:
-            data = self._build_send_data(text)
-            self.serial_service.send_bytes(data)
+            payloads = self._build_send_payloads(text)
+            if len(payloads) == 1:
+                self.serial_service.send_bytes(payloads[0])
+            else:
+                self.serial_service.send_bytes_sequence(
+                    payloads,
+                    interval_seconds=self.MULTI_LINE_SEND_INTERVAL_SECONDS,
+                )
         except (RuntimeError, ValueError) as exc:
             self.show_error(str(exc))
             return False
 
-        self._send_byte_count += len(data)
-        self._pending_send_bytes += len(data)
+        total_bytes = sum(len(payload) for payload in payloads)
+        self._send_byte_count += total_bytes
+        self._pending_send_bytes += total_bytes
         self._update_transfer_stats()
         self._record_send_history(text)
         self.settings.setValue(self.SETTINGS_LAST_SEND, text)
-        self._append_log_entry(self.DIR_SEND, data, is_hex=self.hex_send_checkbox.isChecked())
+        for payload in payloads:
+            self._append_log_entry(self.DIR_SEND, payload, is_hex=self.hex_send_checkbox.isChecked())
 
         if clear_input:
             self.send_input.clear()
 
         if show_success:
-            self.statusBar().showMessage(f"发送请求已提交，等待串口发送 {len(data)} 字节")
+            self.statusBar().showMessage(f"发送请求已提交，等待串口发送 {total_bytes} 字节")
 
         return True
 
-    def _build_send_data(self, text: str) -> bytes:
+    def _build_send_payloads(self, text: str) -> list[bytes]:
         if text == "":
             raise ValueError("发送内容不能为空")
 
@@ -309,14 +318,23 @@ class MainWindow(QMainWindow):
                 data = bytes.fromhex(text)
             except ValueError as exc:
                 raise ValueError("HEX 发送格式不正确，请使用如 01 02 0A 的格式") from exc
-        else:
-            line_ending = str(self.line_ending_combo.currentData() or "")
-            data = f"{text}{line_ending}".encode("utf-8")
+            if not data:
+                raise ValueError("发送内容不能为空")
+            return [data]
 
-        if not data:
-            raise ValueError("发送内容不能为空")
+        line_ending = str(self.line_ending_combo.currentData() or "")
+        lines = text.splitlines()
+        if not lines:
+            lines = [text]
 
-        return data
+        payloads: list[bytes] = []
+        for line in lines:
+            payload = f"{line}{line_ending}".encode("utf-8")
+            if not payload:
+                raise ValueError("发送内容不能为空")
+            payloads.append(payload)
+
+        return payloads
 
     def append_received_text(self, data: bytes) -> None:
         self._received_buffer.extend(data)
@@ -389,7 +407,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._build_send_data(self.send_input.toPlainText())
+            self._build_send_payloads(self.send_input.toPlainText())
         except ValueError as exc:
             self.show_error(str(exc))
             return
