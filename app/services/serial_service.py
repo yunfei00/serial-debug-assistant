@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import time
 from typing import Optional
 
 import serial
@@ -56,12 +57,12 @@ class SerialWriteThread(QThread):
         super().__init__()
         self._serial_port = serial_port
         self._running = True
-        self._send_queue: queue.Queue[bytes] = queue.Queue()
+        self._send_queue: queue.Queue[tuple[bytes, float]] = queue.Queue()
 
     def run(self) -> None:
         while self._running:
             try:
-                data = self._send_queue.get(timeout=0.1)
+                data, delay_after = self._send_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -74,6 +75,8 @@ class SerialWriteThread(QThread):
                 sent = self._write_all(data)
                 self._serial_port.flush()
                 self.data_sent.emit(sent)
+                if delay_after > 0 and self._running:
+                    time.sleep(delay_after)
             except serial.SerialTimeoutException as exc:
                 if self._running:
                     self.error_occurred.emit(f"发送超时：{exc}")
@@ -87,8 +90,8 @@ class SerialWriteThread(QThread):
                     self.error_occurred.emit(f"发送数据时发生异常：{exc}")
                 break
 
-    def enqueue(self, data: bytes) -> None:
-        self._send_queue.put(data)
+    def enqueue(self, data: bytes, delay_after: float = 0.0) -> None:
+        self._send_queue.put((data, max(0.0, delay_after)))
 
     def _write_all(self, data: bytes) -> int:
         """确保一次任务中的字节全部发送完成。"""
@@ -105,7 +108,7 @@ class SerialWriteThread(QThread):
 
     def stop(self) -> None:
         self._running = False
-        self._send_queue.put(b"")
+        self._send_queue.put((b"", 0.0))
         self.wait(1000)
 
 
@@ -229,6 +232,21 @@ class SerialService(QObject):
             raise ValueError("发送内容不能为空")
 
         self._write_thread.enqueue(data)
+
+    def send_bytes_sequence(self, payloads: list[bytes], interval_seconds: float = 0.0) -> None:
+        """按顺序发送多条数据，可配置相邻两条数据的发送间隔。"""
+        if not self.is_open() or self._serial_port is None or self._write_thread is None:
+            raise RuntimeError("串口未打开")
+
+        if not payloads:
+            raise ValueError("发送内容不能为空")
+
+        normalized_interval = max(0.0, float(interval_seconds))
+        for index, payload in enumerate(payloads):
+            if not payload:
+                raise ValueError(f"第 {index + 1} 条发送内容为空")
+            delay = normalized_interval if index < len(payloads) - 1 else 0.0
+            self._write_thread.enqueue(payload, delay_after=delay)
 
     def send_text(self, text: str) -> None:
         """发送文本数据。"""
