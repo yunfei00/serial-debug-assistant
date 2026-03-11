@@ -50,6 +50,7 @@ class SerialReadThread(QThread):
 class SerialWriteThread(QThread):
     """后台发送串口数据，避免发送阻塞界面。"""
 
+    data_sent = Signal(int)
     error_occurred = Signal(str)
 
     def __init__(self, serial_port: serial.Serial) -> None:
@@ -71,8 +72,9 @@ class SerialWriteThread(QThread):
             try:
                 if not self._serial_port.is_open:
                     break
-                self._serial_port.write(data)
+                sent = self._write_all(data)
                 self._serial_port.flush()
+                self.data_sent.emit(sent)
             except serial.SerialTimeoutException as exc:
                 if self._running:
                     self.error_occurred.emit(f"发送超时：{exc}")
@@ -89,6 +91,19 @@ class SerialWriteThread(QThread):
     def enqueue(self, data: bytes) -> None:
         self._send_queue.put(data)
 
+    def _write_all(self, data: bytes) -> int:
+        """确保一次任务中的字节全部发送完成。"""
+        view = memoryview(data)
+        total_sent = 0
+
+        while total_sent < len(view):
+            sent = self._serial_port.write(view[total_sent:])
+            if sent <= 0:
+                raise serial.SerialTimeoutException("写入串口返回 0 字节")
+            total_sent += sent
+
+        return total_sent
+
     def stop(self) -> None:
         self._running = False
         self._send_queue.put(b"")
@@ -99,6 +114,7 @@ class SerialService(QObject):
     """串口服务，负责串口操作与状态管理。"""
 
     data_received = Signal(bytes)
+    data_sent = Signal(int)
     error_occurred = Signal(str)
     connection_changed = Signal(bool, str)
 
@@ -171,6 +187,7 @@ class SerialService(QObject):
         self._read_thread.start()
 
         self._write_thread = SerialWriteThread(serial_port)
+        self._write_thread.data_sent.connect(self.data_sent.emit)
         self._write_thread.error_occurred.connect(self._handle_thread_error)
         self._write_thread.start()
 
