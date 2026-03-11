@@ -27,12 +27,11 @@ class SerialReadThread(QThread):
                 if not self._serial_port.is_open:
                     break
 
-                chunk = self._serial_port.read_all()
+                waiting = self._serial_port.in_waiting
+                read_size = waiting if waiting > 0 else 1
+                chunk = self._serial_port.read(read_size)
                 if chunk:
                     self.data_received.emit(chunk)
-                    continue
-
-                self.msleep(10)
             except serial.SerialException as exc:
                 if self._running:
                     self.error_occurred.emit(f"串口读取失败：{exc}")
@@ -174,7 +173,6 @@ class SerialService(QObject):
                 timeout=config.timeout,
                 write_timeout=config.write_timeout,
             )
-            serial_port.reset_input_buffer()
             serial_port.reset_output_buffer()
         except serial.SerialException as exc:
             raise RuntimeError(f"打开串口失败：{exc}") from exc
