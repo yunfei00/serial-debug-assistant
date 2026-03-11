@@ -1,5 +1,6 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import queue
 from typing import Optional
 
 import serial
@@ -26,9 +27,12 @@ class SerialReadThread(QThread):
                 if not self._serial_port.is_open:
                     break
 
-                chunk = self._serial_port.read(self._serial_port.in_waiting or 1)
+                chunk = self._serial_port.read_all()
                 if chunk:
                     self.data_received.emit(chunk)
+                    continue
+
+                self.msleep(10)
             except serial.SerialException as exc:
                 if self._running:
                     self.error_occurred.emit(f"串口读取失败：{exc}")
@@ -40,6 +44,54 @@ class SerialReadThread(QThread):
 
     def stop(self) -> None:
         self._running = False
+        self.wait(1000)
+
+
+class SerialWriteThread(QThread):
+    """后台发送串口数据，避免发送阻塞界面。"""
+
+    error_occurred = Signal(str)
+
+    def __init__(self, serial_port: serial.Serial) -> None:
+        super().__init__()
+        self._serial_port = serial_port
+        self._running = True
+        self._send_queue: queue.Queue[bytes] = queue.Queue()
+
+    def run(self) -> None:
+        while self._running:
+            try:
+                data = self._send_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if data == b"" and not self._running:
+                break
+
+            try:
+                if not self._serial_port.is_open:
+                    break
+                self._serial_port.write(data)
+                self._serial_port.flush()
+            except serial.SerialTimeoutException as exc:
+                if self._running:
+                    self.error_occurred.emit(f"发送超时：{exc}")
+                break
+            except serial.SerialException as exc:
+                if self._running:
+                    self.error_occurred.emit(f"发送失败：{exc}")
+                break
+            except Exception as exc:  # noqa: BLE001
+                if self._running:
+                    self.error_occurred.emit(f"发送数据时发生异常：{exc}")
+                break
+
+    def enqueue(self, data: bytes) -> None:
+        self._send_queue.put(data)
+
+    def stop(self) -> None:
+        self._running = False
+        self._send_queue.put(b"")
         self.wait(1000)
 
 
@@ -71,6 +123,7 @@ class SerialService(QObject):
         super().__init__()
         self._serial_port: Optional[serial.Serial] = None
         self._read_thread: Optional[SerialReadThread] = None
+        self._write_thread: Optional[SerialWriteThread] = None
 
     def list_ports(self) -> list[SerialPortInfo]:
         """枚举系统串口列表。"""
@@ -105,14 +158,22 @@ class SerialService(QObject):
                 timeout=config.timeout,
                 write_timeout=config.write_timeout,
             )
+            serial_port.reset_input_buffer()
+            serial_port.reset_output_buffer()
         except serial.SerialException as exc:
             raise RuntimeError(f"打开串口失败：{exc}") from exc
 
         self._serial_port = serial_port
+
         self._read_thread = SerialReadThread(serial_port)
         self._read_thread.data_received.connect(self.data_received.emit)
         self._read_thread.error_occurred.connect(self._handle_thread_error)
         self._read_thread.start()
+
+        self._write_thread = SerialWriteThread(serial_port)
+        self._write_thread.error_occurred.connect(self._handle_thread_error)
+        self._write_thread.start()
+
         self.connection_changed.emit(
             True,
             f"已打开串口：{config.port_name}，{config.baudrate} bps，{config.data_bits}{config.parity}{self._format_stop_bits(config.stop_bits)}",
@@ -125,6 +186,10 @@ class SerialService(QObject):
         if self._read_thread is not None:
             self._read_thread.stop()
             self._read_thread = None
+
+        if self._write_thread is not None:
+            self._write_thread.stop()
+            self._write_thread = None
 
         if self._serial_port is not None:
             try:
@@ -142,18 +207,13 @@ class SerialService(QObject):
 
     def send_bytes(self, data: bytes) -> None:
         """发送字节数据。"""
-        if not self.is_open() or self._serial_port is None:
+        if not self.is_open() or self._serial_port is None or self._write_thread is None:
             raise RuntimeError("串口未打开")
 
         if not data:
             raise ValueError("发送内容不能为空")
 
-        try:
-            self._serial_port.write(data)
-        except serial.SerialTimeoutException as exc:
-            raise RuntimeError(f"发送超时：{exc}") from exc
-        except serial.SerialException as exc:
-            raise RuntimeError(f"发送失败：{exc}") from exc
+        self._write_thread.enqueue(data)
 
     def send_text(self, text: str) -> None:
         """发送文本数据。"""
