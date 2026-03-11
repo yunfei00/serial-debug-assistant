@@ -31,6 +31,12 @@ class MainWindow(QMainWindow):
     DATA_BITS = ["5", "6", "7", "8"]
     PARITY_OPTIONS = [("无校验", "N"), ("奇校验", "O"), ("偶校验", "E")]
     STOP_BITS_OPTIONS = [("1", "1.0"), ("1.5", "1.5"), ("2", "2.0")]
+    LINE_ENDING_OPTIONS = [
+        ("无", ""),
+        ("CR(\\r)", "\r"),
+        ("LF(\\n)", "\n"),
+        ("CRLF(\\r\\n)", "\r\n"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -133,6 +139,16 @@ class MainWindow(QMainWindow):
         self.hex_send_checkbox = QCheckBox("HEX 发送")
         send_option_layout.addWidget(self.hex_send_checkbox)
 
+        send_option_layout.addWidget(QLabel("行尾："))
+        self.line_ending_combo = QComboBox()
+        for label, value in self.LINE_ENDING_OPTIONS:
+            self.line_ending_combo.addItem(label, value)
+        self.line_ending_combo.setCurrentText("CRLF(\\r\\n)")
+        send_option_layout.addWidget(self.line_ending_combo)
+
+        self.at_button = QPushButton("发送 AT")
+        send_option_layout.addWidget(self.at_button)
+
         send_option_layout.addWidget(QLabel("发送历史："))
         self.history_combo = QComboBox()
         self.history_combo.setMinimumWidth(280)
@@ -185,6 +201,7 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(lambda: self.open_port())
         self.close_button.clicked.connect(lambda: self.close_port())
         self.send_button.clicked.connect(lambda: self.send_text())
+        self.at_button.clicked.connect(lambda: self.send_at_command())
         self.clear_button.clicked.connect(lambda: self.clear_receive_area())
         self.save_log_button.clicked.connect(lambda: self.save_receive_log())
         self.reset_stats_button.clicked.connect(lambda: self.reset_transfer_stats())
@@ -193,6 +210,7 @@ class MainWindow(QMainWindow):
         self.port_combo.currentIndexChanged.connect(self._on_port_changed)
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
+        self.hex_send_checkbox.toggled.connect(self._on_hex_send_toggled)
         self.wrap_checkbox.toggled.connect(self._apply_wrap_mode)
         self.start_timer_button.clicked.connect(lambda: self.start_auto_send())
         self.stop_timer_button.clicked.connect(lambda: self.stop_auto_send())
@@ -241,6 +259,10 @@ class MainWindow(QMainWindow):
     def send_text(self) -> None:
         self._send_current_text(clear_input=True, show_success=True)
 
+    def send_at_command(self) -> None:
+        self.send_input.setText("AT")
+        self._send_current_text(clear_input=False, show_success=True)
+
     def send_text_by_timer(self) -> None:
         if not self._send_current_text(clear_input=False, show_success=False):
             self.stop_auto_send(show_message=False)
@@ -278,7 +300,8 @@ class MainWindow(QMainWindow):
             except ValueError as exc:
                 raise ValueError("HEX 发送格式不正确，请使用如 01 02 0A 的格式") from exc
         else:
-            data = text.encode("utf-8")
+            line_ending = str(self.line_ending_combo.currentData() or "")
+            data = f"{text}{line_ending}".encode("utf-8")
 
         if not data:
             raise ValueError("发送内容不能为空")
@@ -435,6 +458,8 @@ class MainWindow(QMainWindow):
         self.send_button.setEnabled(is_open and not is_auto_sending)
         self.send_input.setEnabled(is_open and not is_auto_sending)
         self.hex_send_checkbox.setEnabled(is_open and not is_auto_sending)
+        self.line_ending_combo.setEnabled(is_open and not is_auto_sending and not self.hex_send_checkbox.isChecked())
+        self.at_button.setEnabled(is_open and not is_auto_sending)
         self.start_timer_button.setEnabled(is_open and not is_auto_sending)
         self.stop_timer_button.setEnabled(is_auto_sending)
         self.interval_spin.setEnabled(is_open and not is_auto_sending)
@@ -443,6 +468,9 @@ class MainWindow(QMainWindow):
             self.history_combo.setEnabled(not is_auto_sending)
         else:
             self.history_combo.setEnabled(False)
+
+    def _on_hex_send_toggled(self, _checked: bool) -> None:
+        self._update_ui_state(self.serial_service.is_open())
 
     def _build_serial_config(self) -> SerialConfig:
         port_name = self._current_port_name()
