@@ -10,7 +10,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -135,8 +134,9 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(send_layout)
 
         send_layout.addWidget(QLabel("发送："))
-        self.send_input = QLineEdit()
-        self.send_input.setPlaceholderText("请输入要发送的文本，HEX 模式示例：01 02 0A")
+        self.send_input = QTextEdit()
+        self.send_input.setPlaceholderText("请输入要发送的文本（支持多行），HEX 模式示例：01 02 0A")
+        self.send_input.setMaximumHeight(90)
         send_layout.addWidget(self.send_input, 1)
 
         self.send_button = QPushButton("发送")
@@ -214,7 +214,6 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(lambda: self.clear_receive_area())
         self.save_log_button.clicked.connect(lambda: self.save_receive_log())
         self.reset_stats_button.clicked.connect(lambda: self.reset_transfer_stats())
-        self.send_input.returnPressed.connect(self.send_text)
 
         self.port_combo.currentIndexChanged.connect(self._on_port_changed)
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
@@ -269,7 +268,7 @@ class MainWindow(QMainWindow):
         self._send_current_text(clear_input=False, show_success=True)
 
     def send_at_command(self) -> None:
-        self.send_input.setText("AT")
+        self.send_input.setPlainText("AT")
         self._send_current_text(clear_input=False, show_success=True)
 
     def send_text_by_timer(self) -> None:
@@ -277,7 +276,7 @@ class MainWindow(QMainWindow):
             self.stop_auto_send(show_message=False)
 
     def _send_current_text(self, clear_input: bool, show_success: bool) -> bool:
-        text = self.send_input.text()
+        text = self.send_input.toPlainText()
 
         try:
             data = self._build_send_data(text)
@@ -390,7 +389,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._build_send_data(self.send_input.text())
+            self._build_send_data(self.send_input.toPlainText())
         except ValueError as exc:
             self.show_error(str(exc))
             return
@@ -448,7 +447,7 @@ class MainWindow(QMainWindow):
         if not self._send_history or index < 0 or index >= len(self._send_history):
             return
 
-        self.send_input.setText(self._send_history[index])
+        self.send_input.setPlainText(self._send_history[index])
 
     def _append_log_entry(self, direction: str, data: bytes, is_hex: bool) -> None:
         processed_data = data
@@ -456,7 +455,8 @@ class MainWindow(QMainWindow):
             if direction == self.DIR_SEND:
                 processed_data = data.rstrip(b"\r\n")
             elif direction == self.DIR_RECEIVE:
-                processed_data = data.strip(b"\r\n")
+                processed_data = data.rstrip(b"\x00")
+                processed_data = processed_data.strip(b"\r\n")
                 if not processed_data:
                     return
 
@@ -466,7 +466,7 @@ class MainWindow(QMainWindow):
     def _load_persistent_state(self) -> None:
         last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
         if last_command:
-            self.send_input.setText(last_command)
+            self.send_input.setPlainText(last_command)
 
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
