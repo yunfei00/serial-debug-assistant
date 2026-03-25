@@ -43,14 +43,17 @@ class MainWindow(QMainWindow):
     SETTINGS_APP = "main-window"
     SETTINGS_LAST_SEND = "send/last_command"
     MULTI_LINE_SEND_INTERVAL_SECONDS = 0.2
+    RECEIVE_MERGE_INTERVAL_MS = 40
 
     def __init__(self) -> None:
         super().__init__()
         self.serial_service = SerialService()
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self.auto_send_timer = QTimer(self)
+        self.receive_merge_timer = QTimer(self)
         self._available_ports: list[SerialPortInfo] = []
         self._received_buffer = bytearray()
+        self._pending_receive_buffer = bytearray()
         self._log_entries: list[tuple[str, str, bytes, bool]] = []
         self._send_history: list[str] = []
         self._send_byte_count = 0
@@ -119,11 +122,6 @@ class MainWindow(QMainWindow):
 
         info_layout = QHBoxLayout()
         main_layout.addLayout(info_layout)
-
-        info_layout.addWidget(QLabel("端口信息："))
-        self.port_info_label = QLabel("未发现可用串口")
-        self.port_info_label.setWordWrap(True)
-        info_layout.addWidget(self.port_info_label, 1)
 
         self.stats_label = QLabel("send: 0 bytes  receive: 0 bytes")
         info_layout.addWidget(self.stats_label)
@@ -216,7 +214,6 @@ class MainWindow(QMainWindow):
         self.save_log_button.clicked.connect(lambda: self.save_receive_log())
         self.reset_stats_button.clicked.connect(lambda: self.reset_transfer_stats())
 
-        self.port_combo.currentIndexChanged.connect(self._on_port_changed)
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
         self.hex_send_checkbox.toggled.connect(self._on_hex_send_toggled)
@@ -225,6 +222,8 @@ class MainWindow(QMainWindow):
         self.stop_timer_button.clicked.connect(lambda: self.stop_auto_send())
 
         self.auto_send_timer.timeout.connect(self.send_text_by_timer)
+        self.receive_merge_timer.setSingleShot(True)
+        self.receive_merge_timer.timeout.connect(self._flush_pending_receive_data)
 
         self.serial_service.data_received.connect(self.append_received_text)
         self.serial_service.data_sent.connect(self.on_data_sent)
@@ -246,7 +245,6 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 self.port_combo.setCurrentIndex(index)
 
-        self._update_port_info()
         count = len(self._available_ports)
         message = f"已刷新，共发现 {count} 个串口" if count else "未发现可用串口"
         self.statusBar().showMessage(message)
@@ -338,9 +336,17 @@ class MainWindow(QMainWindow):
 
     def append_received_text(self, data: bytes) -> None:
         self._received_buffer.extend(data)
+        self._pending_receive_buffer.extend(data)
         self._receive_byte_count += len(data)
         self._update_transfer_stats()
-        self._append_log_entry(self.DIR_RECEIVE, data, is_hex=False)
+        self.receive_merge_timer.start(self.RECEIVE_MERGE_INTERVAL_MS)
+
+    def _flush_pending_receive_data(self) -> None:
+        if not self._pending_receive_buffer:
+            return
+        merged_data = bytes(self._pending_receive_buffer)
+        self._pending_receive_buffer.clear()
+        self._append_log_entry(self.DIR_RECEIVE, merged_data, is_hex=False)
         self._refresh_receive_display()
 
     def on_data_sent(self, sent_bytes: int) -> None:
@@ -369,7 +375,9 @@ class MainWindow(QMainWindow):
         self.receive_text.setLineWrapMode(mode)
 
     def clear_receive_area(self) -> None:
+        self.receive_merge_timer.stop()
         self._received_buffer.clear()
+        self._pending_receive_buffer.clear()
         self._log_entries.clear()
         self.receive_text.clear()
         self.statusBar().showMessage("接收区已清空")
@@ -538,31 +546,6 @@ class MainWindow(QMainWindow):
     def _current_port_name(self) -> str:
         data = self.port_combo.currentData()
         return str(data) if data else ""
-
-    def _on_port_changed(self, _index: int) -> None:
-        self._update_port_info()
-
-    def _update_port_info(self) -> None:
-        port_info = self._get_selected_port_info()
-        if port_info is None:
-            self.port_info_label.setText("未发现可用串口")
-            return
-
-        details = [f"设备：{port_info.device}"]
-        if port_info.description:
-            details.append(f"描述：{port_info.description}")
-        if port_info.manufacturer:
-            details.append(f"厂商：{port_info.manufacturer}")
-        if port_info.hwid:
-            details.append(f"硬件ID：{port_info.hwid}")
-        self.port_info_label.setText("  |  ".join(details))
-
-    def _get_selected_port_info(self) -> SerialPortInfo | None:
-        port_name = self._current_port_name()
-        for port_info in self._available_ports:
-            if port_info.device == port_name:
-                return port_info
-        return None
 
     def show_error(self, message: str) -> None:
         self.statusBar().showMessage(message)
