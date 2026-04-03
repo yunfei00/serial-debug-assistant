@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 
 from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QTextCursor
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QPushButton,
     QSpinBox,
     QTextEdit,
@@ -42,6 +44,8 @@ class MainWindow(QMainWindow):
     SETTINGS_ORG = "serial-debug-assistant"
     SETTINGS_APP = "main-window"
     SETTINGS_LAST_SEND = "send/last_command"
+    SETTINGS_COMMAND_SETS = "send/command_sets"
+    SETTINGS_LAST_COMMAND_SET = "send/last_command_set"
     MULTI_LINE_SEND_INTERVAL_SECONDS = 0.2
     RECEIVE_MERGE_INTERVAL_MS = 40
 
@@ -56,6 +60,7 @@ class MainWindow(QMainWindow):
         self._pending_receive_buffer = bytearray()
         self._log_entries: list[tuple[str, str, bytes, bool]] = []
         self._send_history: list[str] = []
+        self._command_sets: dict[str, list[str]] = {}
         self._send_byte_count = 0
         self._receive_byte_count = 0
         self._pending_send_bytes = 0
@@ -161,6 +166,14 @@ class MainWindow(QMainWindow):
         self.history_combo = QComboBox()
         self.history_combo.setMinimumWidth(280)
         send_option_layout.addWidget(self.history_combo, 1)
+
+        send_option_layout.addWidget(QLabel("命令集："))
+        self.command_set_combo = QComboBox()
+        self.command_set_combo.setMinimumWidth(180)
+        send_option_layout.addWidget(self.command_set_combo)
+
+        self.save_command_set_button = QPushButton("保存命令集")
+        send_option_layout.addWidget(self.save_command_set_button)
         send_option_layout.addStretch()
 
         timer_layout = QHBoxLayout()
@@ -213,8 +226,10 @@ class MainWindow(QMainWindow):
         self.clear_button.clicked.connect(lambda: self.clear_receive_area())
         self.save_log_button.clicked.connect(lambda: self.save_receive_log())
         self.reset_stats_button.clicked.connect(lambda: self.reset_transfer_stats())
+        self.save_command_set_button.clicked.connect(lambda: self.save_command_set())
 
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
+        self.command_set_combo.currentIndexChanged.connect(self._on_command_set_changed)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
         self.hex_send_checkbox.toggled.connect(self._on_hex_send_toggled)
         self.wrap_checkbox.toggled.connect(self._apply_wrap_mode)
@@ -493,6 +508,102 @@ class MainWindow(QMainWindow):
         last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
         if last_command:
             self.send_input.setPlainText(last_command)
+
+        self._load_command_sets_from_settings()
+        self._refresh_command_set_combo()
+        self._restore_last_command_set()
+
+    def save_command_set(self) -> None:
+        if not self._send_history:
+            self.show_error("当前没有可保存的发送历史")
+            return
+
+        default_name = str(self.command_set_combo.currentText() or "").strip()
+        name, ok = QInputDialog.getText(self, "保存命令集", "请输入命令集名称：", text=default_name)
+        if not ok:
+            return
+
+        set_name = name.strip()
+        if not set_name:
+            self.show_error("命令集名称不能为空")
+            return
+
+        self._command_sets[set_name] = list(self._send_history)
+        self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, set_name)
+        self._persist_command_sets()
+        self._refresh_command_set_combo(selected_name=set_name)
+        self.statusBar().showMessage(f"命令集“{set_name}”已保存")
+
+    def _on_command_set_changed(self, index: int) -> None:
+        if index < 0:
+            return
+
+        name = str(self.command_set_combo.currentData() or "")
+        if not name or name not in self._command_sets:
+            return
+
+        self._send_history = list(self._command_sets[name])
+        self._refresh_history_combo()
+        self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, name)
+        if self._send_history:
+            self.send_input.setPlainText(self._send_history[0])
+        self.statusBar().showMessage(f"已加载命令集：{name}")
+
+    def _refresh_command_set_combo(self, selected_name: str | None = None) -> None:
+        self.command_set_combo.blockSignals(True)
+        self.command_set_combo.clear()
+
+        if self._command_sets:
+            for name in sorted(self._command_sets):
+                self.command_set_combo.addItem(name, name)
+
+            target_name = selected_name or str(self.settings.value(self.SETTINGS_LAST_COMMAND_SET, "") or "")
+            index = self.command_set_combo.findData(target_name)
+            self.command_set_combo.setCurrentIndex(index if index >= 0 else 0)
+            self.command_set_combo.setEnabled(True)
+        else:
+            self.command_set_combo.addItem("暂无命令集")
+            self.command_set_combo.setEnabled(False)
+
+        self.command_set_combo.blockSignals(False)
+
+    def _load_command_sets_from_settings(self) -> None:
+        raw_value = self.settings.value(self.SETTINGS_COMMAND_SETS, "{}", type=str)
+        self._command_sets = {}
+        if not raw_value:
+            return
+
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return
+
+        if not isinstance(parsed, dict):
+            return
+
+        for name, commands in parsed.items():
+            if not isinstance(name, str) or not isinstance(commands, list):
+                continue
+            normalized_commands = [item for item in commands if isinstance(item, str) and item != ""]
+            if normalized_commands:
+                self._command_sets[name] = normalized_commands
+
+    def _persist_command_sets(self) -> None:
+        self.settings.setValue(self.SETTINGS_COMMAND_SETS, json.dumps(self._command_sets, ensure_ascii=False))
+
+    def _restore_last_command_set(self) -> None:
+        if not self._command_sets:
+            return
+
+        last_set_name = str(self.settings.value(self.SETTINGS_LAST_COMMAND_SET, "") or "")
+        if not last_set_name or last_set_name not in self._command_sets:
+            last_set_name = next(iter(sorted(self._command_sets)))
+
+        self._send_history = list(self._command_sets[last_set_name])
+        self._refresh_history_combo()
+        self._refresh_command_set_combo(selected_name=last_set_name)
+        if self._send_history:
+            self.send_input.setPlainText(self._send_history[0])
 
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
