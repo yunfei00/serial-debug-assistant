@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QInputDialog,
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.models import SerialConfig, SerialPortInfo
+from app.core.models import SendHistoryItem, SerialConfig, SerialPortInfo
 from app.services.serial_service import SerialService
 
 
@@ -47,7 +48,7 @@ class MainWindow(QMainWindow):
     SETTINGS_LAST_SEND = "send/last_command"
     SETTINGS_COMMAND_SETS = "send/command_sets"
     SETTINGS_LAST_COMMAND_SET = "send/last_command_set"
-    SETTINGS_MULTI_LINE_MODE = "send/multi_line_mode"
+    SETTINGS_LAST_SEND_DESCRIPTION = "send/last_description"
     MULTI_LINE_SEND_INTERVAL_SECONDS = 0.2
     RECEIVE_MERGE_INTERVAL_MS = 40
     RECONNECT_CHECK_INTERVAL_MS = 5000
@@ -65,8 +66,8 @@ class MainWindow(QMainWindow):
         self._received_buffer = bytearray()
         self._pending_receive_buffer = bytearray()
         self._log_entries: list[tuple[str, str, bytes, bool]] = []
-        self._send_history: list[str] = []
-        self._command_sets: dict[str, list[str]] = {}
+        self._send_history: list[SendHistoryItem] = []
+        self._command_sets: dict[str, list[SendHistoryItem]] = {}
         self._send_byte_count = 0
         self._receive_byte_count = 0
         self._pending_send_bytes = 0
@@ -162,11 +163,12 @@ class MainWindow(QMainWindow):
         self.send_button = QPushButton("发送")
         send_layout.addWidget(self.send_button)
 
-        send_note_layout = QHBoxLayout()
-        main_layout.addLayout(send_note_layout)
-        self.command_note_label = QLabel("命令说明：多行命令可选择“空格分隔”；不选择时默认按换行分隔。")
-        send_note_layout.addWidget(self.command_note_label)
-        send_note_layout.addStretch()
+        send_description_layout = QHBoxLayout()
+        main_layout.addLayout(send_description_layout)
+        send_description_layout.addWidget(QLabel("命令描述："))
+        self.send_description_input = QLineEdit()
+        self.send_description_input.setPlaceholderText("用于说明发送命令用途（可选）")
+        send_description_layout.addWidget(self.send_description_input, 1)
 
         send_option_layout = QHBoxLayout()
         main_layout.addLayout(send_option_layout)
@@ -188,12 +190,6 @@ class MainWindow(QMainWindow):
         self.history_combo = QComboBox()
         self.history_combo.setMinimumWidth(280)
         send_option_layout.addWidget(self.history_combo, 1)
-
-        send_option_layout.addWidget(QLabel("多行分隔："))
-        self.multi_line_mode_combo = QComboBox()
-        self.multi_line_mode_combo.addItem("默认(换行)", "newline")
-        self.multi_line_mode_combo.addItem("空格", "space")
-        send_option_layout.addWidget(self.multi_line_mode_combo)
 
         send_option_layout.addWidget(QLabel("命令集："))
         self.command_set_combo = QComboBox()
@@ -258,7 +254,6 @@ class MainWindow(QMainWindow):
 
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
         self.command_set_combo.currentIndexChanged.connect(self._on_command_set_changed)
-        self.multi_line_mode_combo.currentIndexChanged.connect(self._on_multi_line_mode_changed)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
         self.hex_send_checkbox.toggled.connect(self._on_hex_send_toggled)
         self.wrap_checkbox.toggled.connect(self._apply_wrap_mode)
@@ -342,6 +337,7 @@ class MainWindow(QMainWindow):
         self._update_transfer_stats()
         self._record_send_history(text)
         self.settings.setValue(self.SETTINGS_LAST_SEND, text)
+        self.settings.setValue(self.SETTINGS_LAST_SEND_DESCRIPTION, self.send_description_input.text().strip())
         for payload in payloads:
             self._append_log_entry(self.DIR_SEND, payload, is_hex=self.hex_send_checkbox.isChecked())
 
@@ -367,11 +363,7 @@ class MainWindow(QMainWindow):
             return [data]
 
         line_ending = str(self.line_ending_combo.currentData() or "")
-        split_mode = str(self.multi_line_mode_combo.currentData() or "newline")
-        if split_mode == "space":
-            lines = [segment for segment in text.split(" ") if segment != ""]
-        else:
-            lines = text.splitlines()
+        lines = text.splitlines()
         if not lines:
             lines = [text]
 
@@ -496,13 +488,14 @@ class MainWindow(QMainWindow):
         )
 
     def _record_send_history(self, text: str) -> None:
-        if self._send_history and self._send_history[0] == text:
+        item = SendHistoryItem(command=text, description=self.send_description_input.text().strip())
+        if self._send_history and self._send_history[0] == item:
             return
 
-        if text in self._send_history:
-            self._send_history.remove(text)
+        if item in self._send_history:
+            self._send_history.remove(item)
 
-        self._send_history.insert(0, text)
+        self._send_history.insert(0, item)
         self._send_history = self._send_history[:30]
         self._refresh_history_combo()
 
@@ -511,7 +504,8 @@ class MainWindow(QMainWindow):
         self.history_combo.clear()
 
         if self._send_history:
-            self.history_combo.addItems(self._send_history)
+            for history_item in self._send_history:
+                self.history_combo.addItem(history_item.display_text)
             self.history_combo.setEnabled(not self.auto_send_timer.isActive())
         else:
             self.history_combo.addItem("暂无历史")
@@ -523,7 +517,9 @@ class MainWindow(QMainWindow):
         if not self._send_history or index < 0 or index >= len(self._send_history):
             return
 
-        self.send_input.setPlainText(self._send_history[index])
+        selected_item = self._send_history[index]
+        self.send_input.setPlainText(selected_item.command)
+        self.send_description_input.setText(selected_item.description)
 
     def _append_log_entry(self, direction: str, data: bytes, is_hex: bool) -> None:
         processed_data = data
@@ -556,9 +552,9 @@ class MainWindow(QMainWindow):
         last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
         if last_command:
             self.send_input.setPlainText(last_command)
-        multi_line_mode = str(self.settings.value(self.SETTINGS_MULTI_LINE_MODE, "newline") or "newline")
-        mode_index = self.multi_line_mode_combo.findData(multi_line_mode)
-        self.multi_line_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        last_description = str(self.settings.value(self.SETTINGS_LAST_SEND_DESCRIPTION, "") or "")
+        if last_description:
+            self.send_description_input.setText(last_description)
 
         self._load_command_sets_from_settings()
         self._refresh_command_set_combo()
@@ -579,7 +575,7 @@ class MainWindow(QMainWindow):
             self.show_error("命令集名称不能为空")
             return
 
-        self._command_sets[set_name] = list(self._send_history)
+        self._command_sets[set_name] = [SendHistoryItem(item.command, item.description) for item in self._send_history]
         self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, set_name)
         self._persist_command_sets()
         self._refresh_command_set_combo(selected_name=set_name)
@@ -597,7 +593,8 @@ class MainWindow(QMainWindow):
         self._refresh_history_combo()
         self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, name)
         if self._send_history:
-            self.send_input.setPlainText(self._send_history[0])
+            self.send_input.setPlainText(self._send_history[0].command)
+            self.send_description_input.setText(self._send_history[0].description)
         self.statusBar().showMessage(f"已加载命令集：{name}")
 
     def _refresh_command_set_combo(self, selected_name: str | None = None) -> None:
@@ -635,12 +632,28 @@ class MainWindow(QMainWindow):
         for name, commands in parsed.items():
             if not isinstance(name, str) or not isinstance(commands, list):
                 continue
-            normalized_commands = [item for item in commands if isinstance(item, str) and item != ""]
+            normalized_commands: list[SendHistoryItem] = []
+            for item in commands:
+                if isinstance(item, str) and item != "":
+                    normalized_commands.append(SendHistoryItem(command=item))
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command", "")).strip()
+                if not command:
+                    continue
+                description = str(item.get("description", "")).strip()
+                normalized_commands.append(SendHistoryItem(command=command, description=description))
             if normalized_commands:
                 self._command_sets[name] = normalized_commands
 
     def _persist_command_sets(self) -> None:
-        self.settings.setValue(self.SETTINGS_COMMAND_SETS, json.dumps(self._command_sets, ensure_ascii=False))
+        serializable_sets: dict[str, list[dict[str, str]]] = {}
+        for set_name, commands in self._command_sets.items():
+            serializable_sets[set_name] = [
+                {"command": item.command, "description": item.description} for item in commands
+            ]
+        self.settings.setValue(self.SETTINGS_COMMAND_SETS, json.dumps(serializable_sets, ensure_ascii=False))
 
     def _restore_last_command_set(self) -> None:
         if not self._command_sets:
@@ -654,7 +667,8 @@ class MainWindow(QMainWindow):
         self._refresh_history_combo()
         self._refresh_command_set_combo(selected_name=last_set_name)
         if self._send_history:
-            self.send_input.setPlainText(self._send_history[0])
+            self.send_input.setPlainText(self._send_history[0].command)
+            self.send_description_input.setText(self._send_history[0].description)
 
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
@@ -686,7 +700,6 @@ class MainWindow(QMainWindow):
         self.start_timer_button.setEnabled(is_open and not is_auto_sending)
         self.stop_timer_button.setEnabled(is_auto_sending)
         self.interval_spin.setEnabled(is_open and not is_auto_sending)
-        self.multi_line_mode_combo.setEnabled(is_open and not is_auto_sending and not self.hex_send_checkbox.isChecked())
 
         if self._send_history:
             self.history_combo.setEnabled(not is_auto_sending)
@@ -695,9 +708,6 @@ class MainWindow(QMainWindow):
 
     def _on_hex_send_toggled(self, _checked: bool) -> None:
         self._update_ui_state(self.serial_service.is_open())
-
-    def _on_multi_line_mode_changed(self, _index: int) -> None:
-        self.settings.setValue(self.SETTINGS_MULTI_LINE_MODE, self.multi_line_mode_combo.currentData())
 
     def _build_serial_config(self) -> SerialConfig:
         port_name = self._current_port_name()
