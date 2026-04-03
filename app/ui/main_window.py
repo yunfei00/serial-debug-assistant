@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+from pathlib import Path
 
 from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QTextCursor
@@ -46,8 +47,11 @@ class MainWindow(QMainWindow):
     SETTINGS_LAST_SEND = "send/last_command"
     SETTINGS_COMMAND_SETS = "send/command_sets"
     SETTINGS_LAST_COMMAND_SET = "send/last_command_set"
+    SETTINGS_MULTI_LINE_MODE = "send/multi_line_mode"
     MULTI_LINE_SEND_INTERVAL_SECONDS = 0.2
     RECEIVE_MERGE_INTERVAL_MS = 40
+    RECONNECT_CHECK_INTERVAL_MS = 5000
+    RECONNECT_LOG_INTERVAL_MS = 60000
 
     def __init__(self) -> None:
         super().__init__()
@@ -55,6 +59,8 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self.auto_send_timer = QTimer(self)
         self.receive_merge_timer = QTimer(self)
+        self.reconnect_check_timer = QTimer(self)
+        self.reconnect_notice_timer = QTimer(self)
         self._available_ports: list[SerialPortInfo] = []
         self._received_buffer = bytearray()
         self._pending_receive_buffer = bytearray()
@@ -64,6 +70,12 @@ class MainWindow(QMainWindow):
         self._send_byte_count = 0
         self._receive_byte_count = 0
         self._pending_send_bytes = 0
+        self._last_serial_config: SerialConfig | None = None
+        self._waiting_reconnect = False
+        self._is_auto_reconnecting = False
+        self._suppress_error_dialog = False
+        self._manual_closing = False
+        self._log_dir = Path(__file__).resolve().parents[2] / "log"
 
         self._setup_ui()
         self._bind_signals()
@@ -125,6 +137,10 @@ class MainWindow(QMainWindow):
         self.close_button = QPushButton("关闭串口")
         connection_layout.addWidget(self.close_button)
 
+        self.auto_detect_checkbox = QCheckBox("自动检测串口并重连")
+        self.auto_detect_checkbox.setChecked(False)
+        connection_layout.addWidget(self.auto_detect_checkbox)
+
         info_layout = QHBoxLayout()
         main_layout.addLayout(info_layout)
 
@@ -146,6 +162,12 @@ class MainWindow(QMainWindow):
         self.send_button = QPushButton("发送")
         send_layout.addWidget(self.send_button)
 
+        send_note_layout = QHBoxLayout()
+        main_layout.addLayout(send_note_layout)
+        self.command_note_label = QLabel("命令说明：多行命令可选择“空格分隔”；不选择时默认按换行分隔。")
+        send_note_layout.addWidget(self.command_note_label)
+        send_note_layout.addStretch()
+
         send_option_layout = QHBoxLayout()
         main_layout.addLayout(send_option_layout)
 
@@ -166,6 +188,12 @@ class MainWindow(QMainWindow):
         self.history_combo = QComboBox()
         self.history_combo.setMinimumWidth(280)
         send_option_layout.addWidget(self.history_combo, 1)
+
+        send_option_layout.addWidget(QLabel("多行分隔："))
+        self.multi_line_mode_combo = QComboBox()
+        self.multi_line_mode_combo.addItem("默认(换行)", "newline")
+        self.multi_line_mode_combo.addItem("空格", "space")
+        send_option_layout.addWidget(self.multi_line_mode_combo)
 
         send_option_layout.addWidget(QLabel("命令集："))
         self.command_set_combo = QComboBox()
@@ -230,6 +258,7 @@ class MainWindow(QMainWindow):
 
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
         self.command_set_combo.currentIndexChanged.connect(self._on_command_set_changed)
+        self.multi_line_mode_combo.currentIndexChanged.connect(self._on_multi_line_mode_changed)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
         self.hex_send_checkbox.toggled.connect(self._on_hex_send_toggled)
         self.wrap_checkbox.toggled.connect(self._apply_wrap_mode)
@@ -239,10 +268,12 @@ class MainWindow(QMainWindow):
         self.auto_send_timer.timeout.connect(self.send_text_by_timer)
         self.receive_merge_timer.setSingleShot(True)
         self.receive_merge_timer.timeout.connect(self._flush_pending_receive_data)
+        self.reconnect_check_timer.timeout.connect(self._attempt_reconnect)
+        self.reconnect_notice_timer.timeout.connect(self._append_reconnect_waiting_notice)
 
         self.serial_service.data_received.connect(self.append_received_text)
         self.serial_service.data_sent.connect(self.on_data_sent)
-        self.serial_service.error_occurred.connect(self.show_error)
+        self.serial_service.error_occurred.connect(self._handle_serial_error)
         self.serial_service.connection_changed.connect(self.on_connection_changed)
 
     def refresh_ports(self) -> None:
@@ -268,14 +299,14 @@ class MainWindow(QMainWindow):
         try:
             config = self._build_serial_config()
             self.serial_service.open_port(config)
+            self._last_serial_config = config
+            self._waiting_reconnect = False
+            self._is_auto_reconnecting = False
+            self._suppress_error_dialog = False
+            self.reconnect_check_timer.stop()
+            self.reconnect_notice_timer.stop()
             self.reset_transfer_stats(show_message=False)
         except (RuntimeError, ValueError) as exc:
-            self.show_error(str(exc))
-
-    def close_port(self) -> None:
-        try:
-            self.serial_service.close_port()
-        except RuntimeError as exc:
             self.show_error(str(exc))
 
     def send_text(self) -> None:
@@ -336,7 +367,11 @@ class MainWindow(QMainWindow):
             return [data]
 
         line_ending = str(self.line_ending_combo.currentData() or "")
-        lines = text.splitlines()
+        split_mode = str(self.multi_line_mode_combo.currentData() or "newline")
+        if split_mode == "space":
+            lines = [segment for segment in text.split(" ") if segment != ""]
+        else:
+            lines = text.splitlines()
         if not lines:
             lines = [text]
 
@@ -503,11 +538,27 @@ class MainWindow(QMainWindow):
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self._log_entries.append((timestamp, direction, processed_data, is_hex))
+        self._append_log_to_file(timestamp, direction, processed_data, is_hex)
+
+    def _append_log_to_file(self, timestamp: str, direction: str, data: bytes, is_hex: bool) -> None:
+        use_hex = is_hex
+        payload = data.hex(" ").upper() if use_hex else data.decode("utf-8", errors="replace")
+        log_line = f"[{timestamp}] {direction}: {payload}\n"
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+            daily_file = self._log_dir / f"{datetime.now().strftime('%Y-%m-%d')}.log"
+            with daily_file.open("a", encoding="utf-8") as file:
+                file.write(log_line)
+        except OSError:
+            self.statusBar().showMessage("写入日志文件失败，请检查 log 目录权限")
 
     def _load_persistent_state(self) -> None:
         last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
         if last_command:
             self.send_input.setPlainText(last_command)
+        multi_line_mode = str(self.settings.value(self.SETTINGS_MULTI_LINE_MODE, "newline") or "newline")
+        mode_index = self.multi_line_mode_combo.findData(multi_line_mode)
+        self.multi_line_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
 
         self._load_command_sets_from_settings()
         self._refresh_command_set_combo()
@@ -609,8 +660,11 @@ class MainWindow(QMainWindow):
         if not is_open:
             self.stop_auto_send(show_message=False)
             self._pending_send_bytes = 0
+            if self.auto_detect_checkbox.isChecked() and not self._manual_closing:
+                self._enter_reconnect_mode()
         self._update_ui_state(is_open)
         self.statusBar().showMessage(message)
+        self._manual_closing = False
 
     def _update_ui_state(self, is_open: bool) -> None:
         is_auto_sending = self.auto_send_timer.isActive()
@@ -632,6 +686,7 @@ class MainWindow(QMainWindow):
         self.start_timer_button.setEnabled(is_open and not is_auto_sending)
         self.stop_timer_button.setEnabled(is_auto_sending)
         self.interval_spin.setEnabled(is_open and not is_auto_sending)
+        self.multi_line_mode_combo.setEnabled(is_open and not is_auto_sending and not self.hex_send_checkbox.isChecked())
 
         if self._send_history:
             self.history_combo.setEnabled(not is_auto_sending)
@@ -640,6 +695,9 @@ class MainWindow(QMainWindow):
 
     def _on_hex_send_toggled(self, _checked: bool) -> None:
         self._update_ui_state(self.serial_service.is_open())
+
+    def _on_multi_line_mode_changed(self, _index: int) -> None:
+        self.settings.setValue(self.SETTINGS_MULTI_LINE_MODE, self.multi_line_mode_combo.currentData())
 
     def _build_serial_config(self) -> SerialConfig:
         port_name = self._current_port_name()
@@ -660,9 +718,70 @@ class MainWindow(QMainWindow):
 
     def show_error(self, message: str) -> None:
         self.statusBar().showMessage(message)
-        QMessageBox.warning(self, "提示", message)
+        if not self._suppress_error_dialog:
+            QMessageBox.warning(self, "提示", message)
+
+    def _handle_serial_error(self, message: str) -> None:
+        if self.auto_detect_checkbox.isChecked():
+            self._suppress_error_dialog = True
+            self.statusBar().showMessage(message)
+            if not self._waiting_reconnect:
+                self._append_log_entry("system", "串口连接中断，已启动自动重连检测（每 5 秒检测一次）".encode("utf-8"), False)
+        else:
+            self._suppress_error_dialog = False
+            self.show_error(message)
+
+    def _enter_reconnect_mode(self) -> None:
+        if self._waiting_reconnect:
+            return
+        self._waiting_reconnect = True
+        self.reconnect_check_timer.start(self.RECONNECT_CHECK_INTERVAL_MS)
+        self.reconnect_notice_timer.start(self.RECONNECT_LOG_INTERVAL_MS)
+        self._append_reconnect_waiting_notice()
+
+    def _append_reconnect_waiting_notice(self) -> None:
+        if not self._waiting_reconnect:
+            return
+        self._append_log_entry("system", "串口仍未恢复，自动重连检测进行中…".encode("utf-8"), False)
+        self._refresh_receive_display()
+
+    def _attempt_reconnect(self) -> None:
+        if not self._waiting_reconnect or self.serial_service.is_open() or self._last_serial_config is None:
+            return
+
+        available_ports = {port.device for port in self.serial_service.list_ports()}
+        if self._last_serial_config.port_name not in available_ports:
+            return
+
+        self._is_auto_reconnecting = True
+        self._suppress_error_dialog = True
+        try:
+            self.serial_service.open_port(self._last_serial_config)
+            self._waiting_reconnect = False
+            self.reconnect_check_timer.stop()
+            self.reconnect_notice_timer.stop()
+            self._append_log_entry("system", f"串口已自动重连：{self._last_serial_config.port_name}".encode("utf-8"), False)
+            self._refresh_receive_display()
+        except (RuntimeError, ValueError):
+            pass
+        finally:
+            self._is_auto_reconnecting = False
+
+    def close_port(self) -> None:
+        self._manual_closing = True
+        self._waiting_reconnect = False
+        self.reconnect_check_timer.stop()
+        self.reconnect_notice_timer.stop()
+        try:
+            self.serial_service.close_port()
+        except RuntimeError as exc:
+            self.show_error(str(exc))
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.stop_auto_send(show_message=False)
+        self._manual_closing = True
+        self._waiting_reconnect = False
+        self.reconnect_check_timer.stop()
+        self.reconnect_notice_timer.stop()
         self.serial_service.dispose()
         super().closeEvent(event)
