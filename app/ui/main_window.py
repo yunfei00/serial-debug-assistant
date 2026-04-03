@@ -57,7 +57,7 @@ class MainWindow(QMainWindow):
     RECEIVE_MERGE_INTERVAL_MS = 40
     RECONNECT_CHECK_INTERVAL_MS = 5000
     RECONNECT_LOG_INTERVAL_MS = 60000
-    QUICK_SEND_SLOT_COUNT = 20
+    QUICK_SEND_SLOT_COUNT = 40
 
     def __init__(self) -> None:
         super().__init__()
@@ -253,8 +253,10 @@ class MainWindow(QMainWindow):
         self.receive_text.setPlaceholderText("接收数据显示区")
         receive_layout.addWidget(self.receive_text, 3)
 
-        quick_send_group = QGroupBox(f"快速命令（默认 {self.QUICK_SEND_SLOT_COUNT} 条）")
+        quick_send_group = QGroupBox(f"快发（{self.QUICK_SEND_SLOT_COUNT}）")
         quick_send_group_layout = QVBoxLayout()
+        quick_send_group_layout.setContentsMargins(6, 6, 6, 6)
+        quick_send_group_layout.setSpacing(4)
         quick_send_group.setLayout(quick_send_group_layout)
         receive_layout.addWidget(quick_send_group, 2)
 
@@ -264,18 +266,23 @@ class MainWindow(QMainWindow):
 
         quick_send_content = QWidget()
         quick_send_layout = QGridLayout()
+        quick_send_layout.setContentsMargins(0, 0, 0, 0)
+        quick_send_layout.setHorizontalSpacing(4)
+        quick_send_layout.setVerticalSpacing(2)
         quick_send_content.setLayout(quick_send_layout)
         quick_send_scroll.setWidget(quick_send_content)
 
         quick_send_layout.addWidget(QLabel("HEX"), 0, 0)
-        quick_send_layout.addWidget(QLabel("字符串"), 0, 1)
-        quick_send_layout.addWidget(QLabel("发送"), 0, 2)
+        quick_send_layout.addWidget(QLabel("命令"), 0, 1)
+        quick_send_layout.addWidget(QLabel("发"), 0, 2)
+        quick_send_layout.setColumnStretch(1, 1)
 
         for index in range(self.QUICK_SEND_SLOT_COUNT):
             hex_checkbox = QCheckBox()
             command_input = QLineEdit()
-            command_input.setPlaceholderText("可填写字符串或 HEX")
+            command_input.setPlaceholderText("命令/HEX")
             send_button = QPushButton(str(index + 1))
+            send_button.setFixedWidth(38)
 
             self.quick_hex_checkboxes.append(hex_checkbox)
             self.quick_command_inputs.append(command_input)
