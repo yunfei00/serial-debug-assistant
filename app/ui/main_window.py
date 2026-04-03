@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 
 from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QTextCursor
@@ -77,6 +78,7 @@ class MainWindow(QMainWindow):
         self._suppress_error_dialog = False
         self._manual_closing = False
         self._log_dir = Path(__file__).resolve().parents[2] / "log"
+        self._command_set_dir = Path(__file__).resolve().parents[2] / "data" / "command_sets"
 
         self._setup_ui()
         self._bind_signals()
@@ -335,7 +337,8 @@ class MainWindow(QMainWindow):
         self._send_byte_count += total_bytes
         self._pending_send_bytes += total_bytes
         self._update_transfer_stats()
-        self._record_send_history(text)
+        new_history_item = self._record_send_history(text)
+        self._append_to_current_command_set(new_history_item)
         self.settings.setValue(self.SETTINGS_LAST_SEND, text)
         self.settings.setValue(self.SETTINGS_LAST_SEND_DESCRIPTION, self.send_description_input.text().strip())
         for payload in payloads:
@@ -487,10 +490,10 @@ class MainWindow(QMainWindow):
             f"send: {self._send_byte_count} bytes  receive: {self._receive_byte_count} bytes"
         )
 
-    def _record_send_history(self, text: str) -> None:
+    def _record_send_history(self, text: str) -> SendHistoryItem | None:
         item = SendHistoryItem(command=text, description=self.send_description_input.text().strip())
         if self._send_history and self._send_history[0] == item:
-            return
+            return None
 
         if item in self._send_history:
             self._send_history.remove(item)
@@ -498,6 +501,21 @@ class MainWindow(QMainWindow):
         self._send_history.insert(0, item)
         self._send_history = self._send_history[:30]
         self._refresh_history_combo()
+        return item
+
+    def _append_to_current_command_set(self, new_item: SendHistoryItem | None) -> None:
+        if new_item is None:
+            return
+
+        current_set_name = str(self.command_set_combo.currentData() or "").strip()
+        if not current_set_name or current_set_name not in self._command_sets:
+            return
+
+        self._command_sets[current_set_name] = [
+            SendHistoryItem(item.command, item.description) for item in self._send_history
+        ]
+        self._persist_single_command_set_to_file(current_set_name)
+        self._persist_command_sets()
 
     def _refresh_history_combo(self) -> None:
         self.history_combo.blockSignals(True)
@@ -577,9 +595,10 @@ class MainWindow(QMainWindow):
 
         self._command_sets[set_name] = [SendHistoryItem(item.command, item.description) for item in self._send_history]
         self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, set_name)
+        saved_file = self._persist_single_command_set_to_file(set_name)
         self._persist_command_sets()
         self._refresh_command_set_combo(selected_name=set_name)
-        self.statusBar().showMessage(f"命令集“{set_name}”已保存")
+        self.statusBar().showMessage(f"命令集“{set_name}”已保存：{saved_file}")
 
     def _on_command_set_changed(self, index: int) -> None:
         if index < 0:
@@ -616,8 +635,11 @@ class MainWindow(QMainWindow):
         self.command_set_combo.blockSignals(False)
 
     def _load_command_sets_from_settings(self) -> None:
+        self._command_sets = self._load_command_sets_from_files()
+        if self._command_sets:
+            return
+
         raw_value = self.settings.value(self.SETTINGS_COMMAND_SETS, "{}", type=str)
-        self._command_sets = {}
         if not raw_value:
             return
 
@@ -647,6 +669,40 @@ class MainWindow(QMainWindow):
             if normalized_commands:
                 self._command_sets[name] = normalized_commands
 
+    def _load_command_sets_from_files(self) -> dict[str, list[SendHistoryItem]]:
+        loaded_sets: dict[str, list[SendHistoryItem]] = {}
+        if not self._command_set_dir.exists():
+            return loaded_sets
+
+        for file_path in sorted(self._command_set_dir.glob("*.json")):
+            try:
+                payload = json.loads(file_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(payload, dict):
+                continue
+
+            name = str(payload.get("name", "")).strip()
+            commands = payload.get("commands")
+            if not name or not isinstance(commands, list):
+                continue
+
+            normalized_commands: list[SendHistoryItem] = []
+            for item in commands:
+                if not isinstance(item, dict):
+                    continue
+                command = str(item.get("command", "")).strip()
+                if not command:
+                    continue
+                description = str(item.get("description", "")).strip()
+                normalized_commands.append(SendHistoryItem(command=command, description=description))
+
+            if normalized_commands:
+                loaded_sets[name] = normalized_commands
+
+        return loaded_sets
+
     def _persist_command_sets(self) -> None:
         serializable_sets: dict[str, list[dict[str, str]]] = {}
         for set_name, commands in self._command_sets.items():
@@ -654,6 +710,26 @@ class MainWindow(QMainWindow):
                 {"command": item.command, "description": item.description} for item in commands
             ]
         self.settings.setValue(self.SETTINGS_COMMAND_SETS, json.dumps(serializable_sets, ensure_ascii=False))
+
+    def _persist_single_command_set_to_file(self, set_name: str) -> str:
+        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", set_name).strip() or "未命名命令集"
+        target_file = self._command_set_dir / f"{safe_name}.json"
+        payload = {
+            "name": set_name,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "commands": [
+                {"command": item.command, "description": item.description}
+                for item in self._command_sets.get(set_name, [])
+            ],
+        }
+
+        try:
+            self._command_set_dir.mkdir(parents=True, exist_ok=True)
+            target_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            self.statusBar().showMessage("保存命令集文件失败，请检查 data/command_sets 目录权限")
+
+        return str(target_file)
 
     def _restore_last_command_set(self) -> None:
         if not self._command_sets:
