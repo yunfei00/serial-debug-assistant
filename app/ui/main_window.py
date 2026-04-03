@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -79,6 +81,11 @@ class MainWindow(QMainWindow):
         self._manual_closing = False
         self._log_dir = Path(__file__).resolve().parents[2] / "log"
         self._command_set_dir = Path(__file__).resolve().parents[2] / "data" / "command_sets"
+        self._suspend_description_auto_clear = False
+        self._loaded_command_text = ""
+        self.quick_hex_checkboxes: list[QCheckBox] = []
+        self.quick_command_inputs: list[QLineEdit] = []
+        self.quick_send_buttons: list[QPushButton] = []
 
         self._setup_ui()
         self._bind_signals()
@@ -236,10 +243,37 @@ class MainWindow(QMainWindow):
         self.clear_button = QPushButton("清空接收区")
         receive_control_layout.addWidget(self.clear_button)
 
+        receive_layout = QHBoxLayout()
+        main_layout.addLayout(receive_layout, 1)
+
         self.receive_text = QTextEdit()
         self.receive_text.setReadOnly(True)
         self.receive_text.setPlaceholderText("接收数据显示区")
-        main_layout.addWidget(self.receive_text, 1)
+        receive_layout.addWidget(self.receive_text, 3)
+
+        quick_send_group = QGroupBox("快速命令")
+        quick_send_layout = QGridLayout()
+        quick_send_group.setLayout(quick_send_layout)
+        receive_layout.addWidget(quick_send_group, 2)
+
+        quick_send_layout.addWidget(QLabel("HEX"), 0, 0)
+        quick_send_layout.addWidget(QLabel("字符串"), 0, 1)
+        quick_send_layout.addWidget(QLabel("发送"), 0, 2)
+
+        for index in range(3):
+            hex_checkbox = QCheckBox()
+            command_input = QLineEdit()
+            command_input.setPlaceholderText("可填写字符串或 HEX")
+            send_button = QPushButton(str(index + 1))
+
+            self.quick_hex_checkboxes.append(hex_checkbox)
+            self.quick_command_inputs.append(command_input)
+            self.quick_send_buttons.append(send_button)
+
+            quick_send_layout.addWidget(hex_checkbox, index + 1, 0)
+            quick_send_layout.addWidget(command_input, index + 1, 1)
+            quick_send_layout.addWidget(send_button, index + 1, 2)
+
 
         self.statusBar().showMessage("就绪")
 
@@ -255,6 +289,7 @@ class MainWindow(QMainWindow):
         self.save_command_set_button.clicked.connect(lambda: self.save_command_set())
 
         self.history_combo.currentIndexChanged.connect(self.load_history_text)
+        self.send_input.textChanged.connect(self._on_send_input_text_changed)
         self.command_set_combo.currentIndexChanged.connect(self._on_command_set_changed)
         self.hex_display_checkbox.toggled.connect(lambda _checked: self._refresh_receive_display())
         self.hex_send_checkbox.toggled.connect(self._on_hex_send_toggled)
@@ -272,6 +307,9 @@ class MainWindow(QMainWindow):
         self.serial_service.data_sent.connect(self.on_data_sent)
         self.serial_service.error_occurred.connect(self._handle_serial_error)
         self.serial_service.connection_changed.connect(self.on_connection_changed)
+
+        for index, button in enumerate(self.quick_send_buttons):
+            button.clicked.connect(lambda _checked=False, row=index: self._send_quick_command(row))
 
     def refresh_ports(self) -> None:
         current_port = self._current_port_name()
@@ -310,7 +348,7 @@ class MainWindow(QMainWindow):
         self._send_current_text(clear_input=False, show_success=True)
 
     def send_at_command(self) -> None:
-        self.send_input.setPlainText("AT")
+        self._set_send_content("AT", "")
         self._send_current_text(clear_input=False, show_success=True)
 
     def send_text_by_timer(self) -> None:
@@ -495,8 +533,7 @@ class MainWindow(QMainWindow):
         if self._send_history and self._send_history[0] == item:
             return None
 
-        if item in self._send_history:
-            self._send_history.remove(item)
+        self._send_history = [history_item for history_item in self._send_history if history_item.command != item.command]
 
         self._send_history.insert(0, item)
         self._send_history = self._send_history[:30]
@@ -536,8 +573,55 @@ class MainWindow(QMainWindow):
             return
 
         selected_item = self._send_history[index]
-        self.send_input.setPlainText(selected_item.command)
-        self.send_description_input.setText(selected_item.description)
+        self._set_send_content(selected_item.command, selected_item.description)
+
+
+    def _set_send_content(self, command: str, description: str) -> None:
+        self._suspend_description_auto_clear = True
+        try:
+            self.send_input.setPlainText(command)
+            self.send_description_input.setText(description)
+            self._loaded_command_text = command
+        finally:
+            self._suspend_description_auto_clear = False
+
+    def _on_send_input_text_changed(self) -> None:
+        if self._suspend_description_auto_clear:
+            return
+
+        current_text = self.send_input.toPlainText()
+        if current_text != self._loaded_command_text and self.send_description_input.text():
+            self.send_description_input.clear()
+
+    def _send_quick_command(self, index: int) -> None:
+        if index < 0 or index >= len(self.quick_command_inputs):
+            return
+
+        text = self.quick_command_inputs[index].text().strip()
+        if text == "":
+            self.show_error("快速命令内容不能为空")
+            return
+
+        is_hex = self.quick_hex_checkboxes[index].isChecked()
+        try:
+            if is_hex:
+                payload = bytes.fromhex(text)
+                if not payload:
+                    raise ValueError("快速命令内容不能为空")
+            else:
+                line_ending = str(self.line_ending_combo.currentData() or "")
+                payload = f"{text}{line_ending}".encode("utf-8")
+            self.serial_service.send_bytes(payload)
+        except (RuntimeError, ValueError):
+            self.show_error("快速命令发送失败，请检查串口状态或 HEX 格式")
+            return
+
+        self._send_byte_count += len(payload)
+        self._pending_send_bytes += len(payload)
+        self._update_transfer_stats()
+        self._append_log_entry(self.DIR_SEND, payload, is_hex=is_hex)
+        self._refresh_receive_display()
+        self.statusBar().showMessage(f"快速命令 {index + 1} 已提交，等待串口发送 {len(payload)} 字节")
 
     def _append_log_entry(self, direction: str, data: bytes, is_hex: bool) -> None:
         processed_data = data
@@ -568,11 +652,9 @@ class MainWindow(QMainWindow):
 
     def _load_persistent_state(self) -> None:
         last_command = str(self.settings.value(self.SETTINGS_LAST_SEND, "") or "")
-        if last_command:
-            self.send_input.setPlainText(last_command)
         last_description = str(self.settings.value(self.SETTINGS_LAST_SEND_DESCRIPTION, "") or "")
-        if last_description:
-            self.send_description_input.setText(last_description)
+        if last_command or last_description:
+            self._set_send_content(last_command, last_description)
 
         self._load_command_sets_from_settings()
         self._refresh_command_set_combo()
@@ -612,8 +694,7 @@ class MainWindow(QMainWindow):
         self._refresh_history_combo()
         self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, name)
         if self._send_history:
-            self.send_input.setPlainText(self._send_history[0].command)
-            self.send_description_input.setText(self._send_history[0].description)
+            self._set_send_content(self._send_history[0].command, self._send_history[0].description)
         self.statusBar().showMessage(f"已加载命令集：{name}")
 
     def _refresh_command_set_combo(self, selected_name: str | None = None) -> None:
@@ -743,8 +824,7 @@ class MainWindow(QMainWindow):
         self._refresh_history_combo()
         self._refresh_command_set_combo(selected_name=last_set_name)
         if self._send_history:
-            self.send_input.setPlainText(self._send_history[0].command)
-            self.send_description_input.setText(self._send_history[0].description)
+            self._set_send_content(self._send_history[0].command, self._send_history[0].description)
 
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
@@ -776,6 +856,14 @@ class MainWindow(QMainWindow):
         self.start_timer_button.setEnabled(is_open and not is_auto_sending)
         self.stop_timer_button.setEnabled(is_auto_sending)
         self.interval_spin.setEnabled(is_open and not is_auto_sending)
+
+        quick_enabled = is_open and not is_auto_sending
+        for quick_checkbox in self.quick_hex_checkboxes:
+            quick_checkbox.setEnabled(quick_enabled)
+        for quick_input in self.quick_command_inputs:
+            quick_input.setEnabled(quick_enabled)
+        for quick_button in self.quick_send_buttons:
+            quick_button.setEnabled(quick_enabled)
 
         if self._send_history:
             self.history_combo.setEnabled(not is_auto_sending)
