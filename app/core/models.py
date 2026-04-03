@@ -30,3 +30,18 @@ class SerialConfig:
     stop_bits: float = 1.0
     timeout: float = 0.1
     write_timeout: float = 1.0
+
+
+@dataclass(slots=True)
+class SendHistoryItem:
+    """发送历史项。"""
+
+    command: str
+    description: str = ""
+
+    @property
+    def display_text(self) -> str:
+        normalized_description = self.description.strip()
+        if normalized_description:
+            return f"{self.command} ({normalized_description})"
+        return self.command
