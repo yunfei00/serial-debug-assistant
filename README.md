@@ -116,6 +116,16 @@ python main.py
 项目新增 GitHub Actions 工作流：
 
 - 普通 `push` / `pull_request`：自动安装依赖并执行 `python -m compileall` 语法检查
-- 当推送 `v*` 标签（如 `v1.0.0`）时：在检查通过后自动创建 Release，并上传源码压缩包
+- Windows 打包任务：使用 PyInstaller 构建单文件 `serial-debug-assistant.exe`，并压缩为 `serial-debug-assistant-<ref>-windows.zip`
+- 打包后会自动解压验证压缩包，确认其中包含非空的 `serial-debug-assistant.exe`
+- 当推送 `v*` 标签（如 `v1.0.0`）时：在检查和打包通过后自动创建 Release，并上传包含 EXE 的 Windows 压缩包
 
 工作流文件：`.github/workflows/ci-release.yml`
+
+发布新版本示例：
+
+```bash
+git tag v0.0.2
+git push origin main
+git push origin v0.0.2
+```
