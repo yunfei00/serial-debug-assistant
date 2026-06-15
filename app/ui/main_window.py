@@ -319,10 +319,14 @@ class MainWindow(QMainWindow):
         self.add_current_to_list_button = QPushButton("添加当前")
         self.add_empty_list_row_button = QPushButton("新增空行")
         self.delete_list_row_button = QPushButton("删除")
+        self.select_all_list_rows_button = QPushButton("全选")
+        self.clear_all_list_rows_button = QPushButton("取消全选")
         self.send_selected_list_button = QPushButton("发送选中")
         list_button_layout.addWidget(self.add_current_to_list_button)
         list_button_layout.addWidget(self.add_empty_list_row_button)
         list_button_layout.addWidget(self.delete_list_row_button)
+        list_button_layout.addWidget(self.select_all_list_rows_button)
+        list_button_layout.addWidget(self.clear_all_list_rows_button)
         list_button_layout.addWidget(self.send_selected_list_button)
 
         self.send_list_table = QTableWidget(0, len(self.SEND_LIST_COLUMNS))
@@ -371,6 +375,8 @@ class MainWindow(QMainWindow):
         self.add_current_to_list_button.clicked.connect(self.add_current_command_to_send_list)
         self.add_empty_list_row_button.clicked.connect(lambda: self._append_send_list_row(SendCommandItem(command="")))
         self.delete_list_row_button.clicked.connect(self.delete_selected_send_list_row)
+        self.select_all_list_rows_button.clicked.connect(lambda: self.set_all_send_list_rows_enabled(True))
+        self.clear_all_list_rows_button.clicked.connect(lambda: self.set_all_send_list_rows_enabled(False))
         self.send_selected_list_button.clicked.connect(self.send_selected_list_command)
         self.start_list_send_button.clicked.connect(self.start_list_send)
         self.stop_list_send_button.clicked.connect(self.stop_list_send)
@@ -764,6 +770,29 @@ class MainWindow(QMainWindow):
         self._persist_send_list()
         self._sync_quick_commands_from_send_list()
         self.statusBar().showMessage("已删除发送列表行")
+
+    def set_all_send_list_rows_enabled(self, enabled: bool) -> None:
+        row_count = self.send_list_table.rowCount()
+        if row_count == 0:
+            self.show_error("发送列表为空")
+            return
+
+        self.send_list_table.blockSignals(True)
+        try:
+            check_state = Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+            for row in range(row_count):
+                item = self.send_list_table.item(row, 0)
+                if item is None:
+                    item = self._checkable_table_item(enabled)
+                    self.send_list_table.setItem(row, 0, item)
+                else:
+                    item.setCheckState(check_state)
+        finally:
+            self.send_list_table.blockSignals(False)
+
+        self._persist_send_list()
+        action_text = "全选" if enabled else "取消全选"
+        self.statusBar().showMessage(f"发送列表已{action_text}")
 
     def send_selected_list_command(self) -> None:
         row = self.send_list_table.currentRow()
@@ -1307,6 +1336,8 @@ class MainWindow(QMainWindow):
         self.add_current_to_list_button.setEnabled(not is_busy_sending)
         self.add_empty_list_row_button.setEnabled(not is_busy_sending)
         self.delete_list_row_button.setEnabled(not is_busy_sending)
+        self.select_all_list_rows_button.setEnabled(not is_busy_sending)
+        self.clear_all_list_rows_button.setEnabled(not is_busy_sending)
         self.send_selected_list_button.setEnabled(is_open and not is_busy_sending)
         self.send_list_table.setEnabled(not is_busy_sending)
         self.start_list_send_button.setEnabled(is_open and not is_busy_sending)
