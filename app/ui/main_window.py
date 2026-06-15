@@ -372,6 +372,9 @@ class MainWindow(QMainWindow):
     def send_text_by_timer(self) -> None:
         if not self._send_current_text(clear_input=False, show_success=False):
             self.stop_auto_send(show_message=False)
+            return
+
+        self.statusBar().showMessage(f"定时发送已提交，间隔 {self.interval_spin.value()} ms")
 
     def _send_current_text(self, clear_input: bool, show_success: bool) -> bool:
         text = self.send_input.toPlainText()
@@ -523,7 +526,8 @@ class MainWindow(QMainWindow):
 
         self.auto_send_timer.start(self.interval_spin.value())
         self._update_ui_state(True)
-        self.statusBar().showMessage("已启动定时发送")
+        self.statusBar().showMessage("已启动定时发送，正在立即发送第一条")
+        self.send_text_by_timer()
 
     def stop_auto_send(self, show_message: bool = True) -> None:
         if self.auto_send_timer.isActive():
