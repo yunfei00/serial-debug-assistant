@@ -45,3 +45,19 @@ class SendHistoryItem:
         if normalized_description:
             return f"{self.command} ({normalized_description})"
         return self.command
+
+
+@dataclass(slots=True)
+class SendCommandItem:
+    """发送列表中的命令项。"""
+
+    command: str
+    description: str = ""
+    is_hex: bool = False
+    enabled: bool = True
+    line_ending: str = "\r\n"
+    interval_ms: int = 1000
+
+    def to_history_item(self) -> SendHistoryItem:
+        """转换为兼容旧命令集的历史项。"""
+        return SendHistoryItem(command=self.command, description=self.description)

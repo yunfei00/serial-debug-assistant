@@ -93,6 +93,21 @@ class SerialWriteThread(QThread):
     def enqueue(self, data: bytes, delay_after: float = 0.0) -> None:
         self._send_queue.put((data, max(0.0, delay_after)))
 
+    def clear_pending(self) -> int:
+        """清空尚未开始写入串口的待发送数据，返回丢弃字节数。"""
+        dropped_bytes = 0
+        while True:
+            try:
+                data, _delay_after = self._send_queue.get_nowait()
+            except queue.Empty:
+                break
+            dropped_bytes += len(data)
+        return dropped_bytes
+
+    def pending_count(self) -> int:
+        """返回应用层发送队列中尚未处理的任务数量。"""
+        return self._send_queue.qsize()
+
     def _write_all(self, data: bytes) -> int:
         """确保一次任务中的字节全部发送完成。"""
         view = memoryview(data)
@@ -247,6 +262,18 @@ class SerialService(QObject):
                 raise ValueError(f"第 {index + 1} 条发送内容为空")
             delay = normalized_interval if index < len(payloads) - 1 else 0.0
             self._write_thread.enqueue(payload, delay_after=delay)
+
+    def clear_pending_writes(self) -> int:
+        """清空应用层尚未发送的队列数据，返回丢弃字节数。"""
+        if self._write_thread is None:
+            return 0
+        return self._write_thread.clear_pending()
+
+    def pending_write_count(self) -> int:
+        """返回应用层待发送任务数量。"""
+        if self._write_thread is None:
+            return 0
+        return self._write_thread.pending_count()
 
     def send_text(self, text: str) -> None:
         """发送文本数据。"""
