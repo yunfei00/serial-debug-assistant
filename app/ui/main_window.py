@@ -6,13 +6,16 @@ from pathlib import Path
 import re
 
 from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -22,12 +25,15 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from app.core.models import SendHistoryItem, SerialConfig, SerialPortInfo
+from app.core.models import SendCommandItem, SendHistoryItem, SerialConfig, SerialPortInfo
 from app.services.serial_service import SerialService
 
 
@@ -53,11 +59,13 @@ class MainWindow(QMainWindow):
     SETTINGS_COMMAND_SETS = "send/command_sets"
     SETTINGS_LAST_COMMAND_SET = "send/last_command_set"
     SETTINGS_LAST_SEND_DESCRIPTION = "send/last_description"
+    SETTINGS_SEND_LIST = "send/list"
     MULTI_LINE_SEND_INTERVAL_SECONDS = 0.2
     RECEIVE_MERGE_INTERVAL_MS = 40
     RECONNECT_CHECK_INTERVAL_MS = 5000
     RECONNECT_LOG_INTERVAL_MS = 60000
     QUICK_SEND_SLOT_COUNT = 40
+    SEND_LIST_COLUMNS = ["启用", "HEX", "命令", "描述", "间隔(ms)"]
 
     def __init__(self) -> None:
         super().__init__()
@@ -76,6 +84,11 @@ class MainWindow(QMainWindow):
         self._send_byte_count = 0
         self._receive_byte_count = 0
         self._pending_send_bytes = 0
+        self._auto_send_pending_bytes = 0
+        self._auto_send_in_flight = False
+        self._list_send_active = False
+        self._list_send_pending_bytes = 0
+        self._list_send_index = -1
         self._last_serial_config: SerialConfig | None = None
         self._waiting_reconnect = False
         self._is_auto_reconnecting = False
@@ -253,12 +266,15 @@ class MainWindow(QMainWindow):
         self.receive_text.setPlaceholderText("接收数据显示区")
         receive_layout.addWidget(self.receive_text, 3)
 
-        quick_send_group = QGroupBox(f"快发（{self.QUICK_SEND_SLOT_COUNT}）")
+        send_side_tabs = QTabWidget()
+        receive_layout.addWidget(send_side_tabs, 2)
+
+        quick_send_group = QWidget()
         quick_send_group_layout = QVBoxLayout()
         quick_send_group_layout.setContentsMargins(6, 6, 6, 6)
         quick_send_group_layout.setSpacing(4)
         quick_send_group.setLayout(quick_send_group_layout)
-        receive_layout.addWidget(quick_send_group, 2)
+        send_side_tabs.addTab(quick_send_group, f"快发（{self.QUICK_SEND_SLOT_COUNT}）")
 
         quick_send_scroll = QScrollArea()
         quick_send_scroll.setWidgetResizable(True)
@@ -292,6 +308,44 @@ class MainWindow(QMainWindow):
             quick_send_layout.addWidget(command_input, index + 1, 1)
             quick_send_layout.addWidget(send_button, index + 1, 2)
 
+        send_list_page = QWidget()
+        send_list_layout = QVBoxLayout()
+        send_list_layout.setContentsMargins(6, 6, 6, 6)
+        send_list_page.setLayout(send_list_layout)
+        send_side_tabs.addTab(send_list_page, "发送列表")
+
+        list_button_layout = QHBoxLayout()
+        send_list_layout.addLayout(list_button_layout)
+        self.add_current_to_list_button = QPushButton("添加当前")
+        self.add_empty_list_row_button = QPushButton("新增空行")
+        self.delete_list_row_button = QPushButton("删除")
+        self.send_selected_list_button = QPushButton("发送选中")
+        list_button_layout.addWidget(self.add_current_to_list_button)
+        list_button_layout.addWidget(self.add_empty_list_row_button)
+        list_button_layout.addWidget(self.delete_list_row_button)
+        list_button_layout.addWidget(self.send_selected_list_button)
+
+        self.send_list_table = QTableWidget(0, len(self.SEND_LIST_COLUMNS))
+        self.send_list_table.setHorizontalHeaderLabels(self.SEND_LIST_COLUMNS)
+        self.send_list_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.send_list_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.send_list_table.horizontalHeader().setStretchLastSection(False)
+        self.send_list_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.send_list_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.send_list_table.setColumnWidth(0, 48)
+        self.send_list_table.setColumnWidth(1, 48)
+        self.send_list_table.setColumnWidth(4, 80)
+        send_list_layout.addWidget(self.send_list_table, 1)
+
+        list_send_layout = QHBoxLayout()
+        send_list_layout.addLayout(list_send_layout)
+        self.loop_list_send_checkbox = QCheckBox("循环")
+        self.start_list_send_button = QPushButton("开始列表发送")
+        self.stop_list_send_button = QPushButton("停止列表发送")
+        list_send_layout.addWidget(self.loop_list_send_checkbox)
+        list_send_layout.addWidget(self.start_list_send_button)
+        list_send_layout.addWidget(self.stop_list_send_button)
+        list_send_layout.addStretch()
 
         self.statusBar().showMessage("就绪")
 
@@ -314,6 +368,13 @@ class MainWindow(QMainWindow):
         self.wrap_checkbox.toggled.connect(self._apply_wrap_mode)
         self.start_timer_button.clicked.connect(lambda: self.start_auto_send())
         self.stop_timer_button.clicked.connect(lambda: self.stop_auto_send())
+        self.add_current_to_list_button.clicked.connect(self.add_current_command_to_send_list)
+        self.add_empty_list_row_button.clicked.connect(lambda: self._append_send_list_row(SendCommandItem(command="")))
+        self.delete_list_row_button.clicked.connect(self.delete_selected_send_list_row)
+        self.send_selected_list_button.clicked.connect(self.send_selected_list_command)
+        self.start_list_send_button.clicked.connect(self.start_list_send)
+        self.stop_list_send_button.clicked.connect(self.stop_list_send)
+        self.send_list_table.itemChanged.connect(lambda _item: self._on_send_list_changed())
 
         self.auto_send_timer.timeout.connect(self.send_text_by_timer)
         self.receive_merge_timer.setSingleShot(True)
@@ -370,10 +431,23 @@ class MainWindow(QMainWindow):
         self._send_current_text(clear_input=False, show_success=True)
 
     def send_text_by_timer(self) -> None:
+        if self._auto_send_in_flight or self._auto_send_pending_bytes > 0:
+            self.statusBar().showMessage("上一轮定时发送尚未完成，已跳过本轮")
+            return
+
+        try:
+            planned_bytes = sum(len(payload) for payload in self._build_send_payloads(self.send_input.toPlainText()))
+        except ValueError as exc:
+            self.show_error(str(exc))
+            self.stop_auto_send(show_message=False)
+            return
+
         if not self._send_current_text(clear_input=False, show_success=False):
             self.stop_auto_send(show_message=False)
             return
 
+        self._auto_send_in_flight = True
+        self._auto_send_pending_bytes = planned_bytes
         self.statusBar().showMessage(f"定时发送已提交，间隔 {self.interval_spin.value()} ms")
 
     def _send_current_text(self, clear_input: bool, show_success: bool) -> bool:
@@ -455,6 +529,14 @@ class MainWindow(QMainWindow):
 
     def on_data_sent(self, sent_bytes: int) -> None:
         self._pending_send_bytes = max(0, self._pending_send_bytes - sent_bytes)
+        if self._auto_send_in_flight:
+            self._auto_send_pending_bytes = max(0, self._auto_send_pending_bytes - sent_bytes)
+            if self._auto_send_pending_bytes == 0:
+                self._auto_send_in_flight = False
+        if self._list_send_active:
+            self._list_send_pending_bytes = max(0, self._list_send_pending_bytes - sent_bytes)
+            if self._list_send_pending_bytes == 0:
+                self._schedule_next_list_command()
         self.statusBar().showMessage(
             f"串口已发送 {sent_bytes} 字节，待发送队列剩余 {self._pending_send_bytes} 字节"
         )
@@ -533,9 +615,16 @@ class MainWindow(QMainWindow):
         if self.auto_send_timer.isActive():
             self.auto_send_timer.stop()
 
+        dropped_bytes = self.serial_service.clear_pending_writes() if self.serial_service.is_open() else 0
+        self._pending_send_bytes = max(0, self._pending_send_bytes - dropped_bytes)
+        self._auto_send_pending_bytes = 0
+        self._auto_send_in_flight = False
         self._update_ui_state(self.serial_service.is_open())
         if show_message:
-            self.statusBar().showMessage("已停止定时发送")
+            message = "已停止定时发送"
+            if dropped_bytes > 0:
+                message = f"{message}，已丢弃待发送 {dropped_bytes} 字节"
+            self.statusBar().showMessage(message)
 
     def reset_transfer_stats(self, show_message: bool = True) -> None:
         self._send_byte_count = 0
@@ -550,8 +639,11 @@ class MainWindow(QMainWindow):
             f"send: {self._send_byte_count} bytes  receive: {self._receive_byte_count} bytes"
         )
 
-    def _record_send_history(self, text: str) -> SendHistoryItem | None:
-        item = SendHistoryItem(command=text, description=self.send_description_input.text().strip())
+    def _record_send_history(self, text: str, description: str | None = None) -> SendHistoryItem | None:
+        item = SendHistoryItem(
+            command=text,
+            description=self.send_description_input.text().strip() if description is None else description,
+        )
         if self._send_history and self._send_history[0] == item:
             return None
 
@@ -573,6 +665,8 @@ class MainWindow(QMainWindow):
         self._command_sets[current_set_name] = [
             SendHistoryItem(item.command, item.description) for item in self._send_history
         ]
+        if not any(item.command == new_item.command for item in self._send_list_items()):
+            self._append_send_list_row(SendCommandItem(command=new_item.command, description=new_item.description))
         self._persist_single_command_set_to_file(current_set_name)
         self._persist_command_sets()
 
@@ -645,6 +739,300 @@ class MainWindow(QMainWindow):
         self._refresh_receive_display()
         self.statusBar().showMessage(f"快速命令 {index + 1} 已提交，等待串口发送 {len(payload)} 字节")
 
+    def add_current_command_to_send_list(self) -> None:
+        text = self.send_input.toPlainText()
+        if text == "":
+            self.show_error("发送内容不能为空")
+            return
+
+        item = SendCommandItem(
+            command=text,
+            description=self.send_description_input.text().strip(),
+            is_hex=self.hex_send_checkbox.isChecked(),
+            line_ending=str(self.line_ending_combo.currentData() or ""),
+            interval_ms=self.interval_spin.value(),
+        )
+        self._append_send_list_row(item)
+        self.statusBar().showMessage("已添加到发送列表")
+
+    def delete_selected_send_list_row(self) -> None:
+        row = self.send_list_table.currentRow()
+        if row < 0:
+            self.show_error("请选择要删除的发送列表行")
+            return
+        self.send_list_table.removeRow(row)
+        self._persist_send_list()
+        self._sync_quick_commands_from_send_list()
+        self.statusBar().showMessage("已删除发送列表行")
+
+    def send_selected_list_command(self) -> None:
+        row = self.send_list_table.currentRow()
+        if row < 0:
+            self.show_error("请选择要发送的列表命令")
+            return
+        item = self._send_list_item_from_row(row)
+        if item is None:
+            return
+        if self._send_command_item(item, source=f"列表命令 {row + 1}"):
+            self._record_send_history(item.command, item.description)
+            self._persist_send_list()
+
+    def start_list_send(self) -> None:
+        if self._list_send_active:
+            return
+        if not self.serial_service.is_open():
+            self.show_error("请先打开串口，再启动列表发送")
+            return
+        if not self._enabled_send_list_rows():
+            self.show_error("发送列表中没有启用的有效命令")
+            return
+
+        self._list_send_active = True
+        self._list_send_index = -1
+        self._list_send_pending_bytes = 0
+        self._update_ui_state(True)
+        self.statusBar().showMessage("已启动列表发送")
+        self._send_next_list_command()
+
+    def stop_list_send(self, show_message: bool = True) -> None:
+        self._list_send_active = False
+        self._list_send_pending_bytes = 0
+        self._list_send_index = -1
+        dropped_bytes = self.serial_service.clear_pending_writes() if self.serial_service.is_open() else 0
+        self._pending_send_bytes = max(0, self._pending_send_bytes - dropped_bytes)
+        self._update_ui_state(self.serial_service.is_open())
+        if show_message:
+            message = "已停止列表发送"
+            if dropped_bytes > 0:
+                message = f"{message}，已丢弃待发送 {dropped_bytes} 字节"
+            self.statusBar().showMessage(message)
+
+    def _send_next_list_command(self) -> None:
+        if not self._list_send_active:
+            return
+
+        rows = self._enabled_send_list_rows()
+        if not rows:
+            self.stop_list_send(show_message=False)
+            self.show_error("发送列表中没有启用的有效命令")
+            return
+
+        next_row = self._next_enabled_row(rows)
+        if next_row is None:
+            self.stop_list_send(show_message=False)
+            self.statusBar().showMessage("列表发送已完成")
+            return
+
+        item = self._send_list_item_from_row(next_row)
+        if item is None:
+            self.stop_list_send(show_message=False)
+            return
+
+        try:
+            payload = self._build_payload_for_command_item(item)
+        except ValueError as exc:
+            self.show_error(str(exc))
+            self.stop_list_send(show_message=False)
+            return
+        self._list_send_index = next_row
+        self._list_send_pending_bytes = len(payload)
+        if not self._send_command_payload(payload, item, source=f"列表命令 {next_row + 1}"):
+            self.stop_list_send(show_message=False)
+
+    def _schedule_next_list_command(self) -> None:
+        if not self._list_send_active:
+            return
+        current_item = self._send_list_item_from_row(self._list_send_index)
+        interval_ms = current_item.interval_ms if current_item else 0
+        QTimer.singleShot(max(0, interval_ms), self._send_next_list_command)
+
+    def _next_enabled_row(self, rows: list[int]) -> int | None:
+        if self._list_send_index < 0:
+            return rows[0]
+
+        for row in rows:
+            if row > self._list_send_index:
+                return row
+
+        if self.loop_list_send_checkbox.isChecked():
+            return rows[0]
+        return None
+
+    def _enabled_send_list_rows(self) -> list[int]:
+        rows: list[int] = []
+        for row in range(self.send_list_table.rowCount()):
+            item = self._send_list_item_from_row(row, show_error=False)
+            if item is not None and item.enabled and item.command.strip():
+                rows.append(row)
+        return rows
+
+    def _send_command_item(self, item: SendCommandItem, source: str) -> bool:
+        try:
+            payload = self._build_payload_for_command_item(item)
+        except ValueError as exc:
+            self.show_error(str(exc))
+            return False
+        return self._send_command_payload(payload, item, source)
+
+    def _send_command_payload(self, payload: bytes, item: SendCommandItem, source: str) -> bool:
+        try:
+            self.serial_service.send_bytes(payload)
+        except (RuntimeError, ValueError) as exc:
+            self.show_error(str(exc))
+            return False
+
+        self._send_byte_count += len(payload)
+        self._pending_send_bytes += len(payload)
+        self._update_transfer_stats()
+        self._append_log_entry(self.DIR_SEND, payload, is_hex=item.is_hex)
+        self._refresh_receive_display()
+        self.statusBar().showMessage(f"{source} 已提交，等待串口发送 {len(payload)} 字节")
+        return True
+
+    def _build_payload_for_command_item(self, item: SendCommandItem) -> bytes:
+        if item.command == "":
+            raise ValueError("发送列表命令不能为空")
+        if item.is_hex:
+            try:
+                data = bytes.fromhex(item.command)
+            except ValueError as exc:
+                raise ValueError("发送列表 HEX 格式不正确，请使用如 01 02 0A 的格式") from exc
+            if not data:
+                raise ValueError("发送列表命令不能为空")
+            return data
+        return f"{item.command}{item.line_ending}".encode("utf-8")
+
+    def _append_send_list_row(self, item: SendCommandItem) -> None:
+        self.send_list_table.blockSignals(True)
+        try:
+            row = self.send_list_table.rowCount()
+            self.send_list_table.insertRow(row)
+            self.send_list_table.setItem(row, 0, self._checkable_table_item(item.enabled))
+            self.send_list_table.setItem(row, 1, self._checkable_table_item(item.is_hex))
+            command_cell = QTableWidgetItem(item.command)
+            command_cell.setData(Qt.ItemDataRole.UserRole, item.line_ending)
+            self.send_list_table.setItem(row, 2, command_cell)
+            self.send_list_table.setItem(row, 3, QTableWidgetItem(item.description))
+            self.send_list_table.setItem(row, 4, QTableWidgetItem(str(max(0, item.interval_ms))))
+            self.send_list_table.setCurrentCell(row, 2)
+        finally:
+            self.send_list_table.blockSignals(False)
+        self._persist_send_list()
+        self._sync_quick_commands_from_send_list()
+
+    def _checkable_table_item(self, checked: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem("")
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        return item
+
+    def _send_list_item_from_row(self, row: int, show_error: bool = True) -> SendCommandItem | None:
+        if row < 0 or row >= self.send_list_table.rowCount():
+            return None
+        command_item = self.send_list_table.item(row, 2)
+        interval_item = self.send_list_table.item(row, 4)
+        command = command_item.text() if command_item is not None else ""
+        line_ending_data = command_item.data(Qt.ItemDataRole.UserRole) if command_item is not None else None
+        description_item = self.send_list_table.item(row, 3)
+        try:
+            interval_ms = max(0, int(interval_item.text())) if interval_item is not None else self.interval_spin.value()
+        except ValueError:
+            if show_error:
+                self.show_error(f"第 {row + 1} 行间隔必须是整数毫秒")
+            return None
+
+        return SendCommandItem(
+            command=command,
+            description=description_item.text().strip() if description_item is not None else "",
+            is_hex=self._table_item_checked(row, 1),
+            enabled=self._table_item_checked(row, 0),
+            line_ending=str(line_ending_data if line_ending_data is not None else self.line_ending_combo.currentData() or ""),
+            interval_ms=interval_ms,
+        )
+
+    def _table_item_checked(self, row: int, column: int) -> bool:
+        item = self.send_list_table.item(row, column)
+        return item is not None and item.checkState() == Qt.CheckState.Checked
+
+    def _send_list_items(self) -> list[SendCommandItem]:
+        items: list[SendCommandItem] = []
+        for row in range(self.send_list_table.rowCount()):
+            item = self._send_list_item_from_row(row, show_error=False)
+            if item is not None and item.command.strip():
+                items.append(item)
+        return items
+
+    def _persist_send_list(self) -> None:
+        items = [
+            {
+                "command": item.command,
+                "description": item.description,
+                "is_hex": item.is_hex,
+                "enabled": item.enabled,
+                "line_ending": item.line_ending,
+                "interval_ms": item.interval_ms,
+            }
+            for item in self._send_list_items()
+        ]
+        self.settings.setValue(self.SETTINGS_SEND_LIST, json.dumps(items, ensure_ascii=False))
+
+    def _on_send_list_changed(self) -> None:
+        self._persist_send_list()
+        self._sync_quick_commands_from_send_list()
+
+    def _load_send_list_from_settings(self) -> None:
+        raw_value = self.settings.value(self.SETTINGS_SEND_LIST, "[]", type=str)
+        if not raw_value:
+            return
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(parsed, list):
+            return
+        for raw_item in parsed:
+            item = self._send_command_item_from_raw(raw_item)
+            if item is not None:
+                self._append_send_list_row(item)
+
+    def _replace_send_list(self, items: list[SendCommandItem]) -> None:
+        self.send_list_table.blockSignals(True)
+        try:
+            self.send_list_table.setRowCount(0)
+        finally:
+            self.send_list_table.blockSignals(False)
+        for item in items:
+            self._append_send_list_row(item)
+
+    def _send_command_item_from_raw(self, raw_item: object) -> SendCommandItem | None:
+        if isinstance(raw_item, str):
+            command = raw_item.strip()
+            return SendCommandItem(command=command) if command else None
+        if not isinstance(raw_item, dict):
+            return None
+        command = str(raw_item.get("command", "")).strip()
+        if not command:
+            return None
+        try:
+            interval_ms = max(0, int(raw_item.get("interval_ms", self.interval_spin.value())))
+        except (TypeError, ValueError):
+            interval_ms = self.interval_spin.value()
+        return SendCommandItem(
+            command=command,
+            description=str(raw_item.get("description", "")).strip(),
+            is_hex=bool(raw_item.get("is_hex", False)),
+            enabled=bool(raw_item.get("enabled", True)),
+            line_ending=str(raw_item.get("line_ending", self.line_ending_combo.currentData() or "")),
+            interval_ms=interval_ms,
+        )
+
+    def _sync_quick_commands_from_send_list(self) -> None:
+        items = self._send_list_items()
+        if items:
+            self._load_quick_commands_from_list([item.to_history_item() for item in items])
+        else:
+            self._clear_quick_commands()
+
     def _append_log_entry(self, direction: str, data: bytes, is_hex: bool) -> None:
         processed_data = data
         if not is_hex:
@@ -681,10 +1069,16 @@ class MainWindow(QMainWindow):
         self._load_command_sets_from_settings()
         self._refresh_command_set_combo()
         self._restore_last_command_set()
+        self._load_send_list_from_settings()
+        if self.send_list_table.rowCount() == 0 and self._send_history:
+            for history_item in self._send_history:
+                self._append_send_list_row(
+                    SendCommandItem(command=history_item.command, description=history_item.description)
+                )
 
     def save_command_set(self) -> None:
-        if not self._send_history:
-            self.show_error("当前没有可保存的发送历史")
+        if not self._send_history and not self._send_list_items():
+            self.show_error("当前没有可保存的发送历史或发送列表")
             return
 
         default_name = str(self.command_set_combo.currentText() or "").strip()
@@ -697,7 +1091,11 @@ class MainWindow(QMainWindow):
             self.show_error("命令集名称不能为空")
             return
 
-        self._command_sets[set_name] = [SendHistoryItem(item.command, item.description) for item in self._send_history]
+        send_list_items = self._send_list_items()
+        if send_list_items:
+            self._command_sets[set_name] = [item.to_history_item() for item in send_list_items]
+        else:
+            self._command_sets[set_name] = [SendHistoryItem(item.command, item.description) for item in self._send_history]
         self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, set_name)
         saved_file = self._persist_single_command_set_to_file(set_name)
         self._persist_command_sets()
@@ -715,6 +1113,7 @@ class MainWindow(QMainWindow):
         self._send_history = list(self._command_sets[name])
         self._refresh_history_combo()
         self._load_quick_commands_from_list(self._send_history)
+        self._replace_send_list([SendCommandItem(command=item.command, description=item.description) for item in self._send_history])
         self.settings.setValue(self.SETTINGS_LAST_COMMAND_SET, name)
         if self._send_history:
             self._set_send_content(self._send_history[0].command, self._send_history[0].description)
@@ -819,13 +1218,25 @@ class MainWindow(QMainWindow):
     def _persist_single_command_set_to_file(self, set_name: str) -> str:
         safe_name = re.sub(r'[\\/:*?"<>|]+', "_", set_name).strip() or "未命名命令集"
         target_file = self._command_set_dir / f"{safe_name}.json"
+        send_list_items = self._send_list_items()
+        commands = [
+            {
+                "command": item.command,
+                "description": item.description,
+                "is_hex": item.is_hex,
+                "enabled": item.enabled,
+                "line_ending": item.line_ending,
+                "interval_ms": item.interval_ms,
+            }
+            for item in send_list_items
+        ] or [
+            {"command": item.command, "description": item.description}
+            for item in self._command_sets.get(set_name, [])
+        ]
         payload = {
             "name": set_name,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "commands": [
-                {"command": item.command, "description": item.description}
-                for item in self._command_sets.get(set_name, [])
-            ],
+            "commands": commands,
         }
 
         try:
@@ -864,6 +1275,7 @@ class MainWindow(QMainWindow):
     def on_connection_changed(self, is_open: bool, message: str) -> None:
         if not is_open:
             self.stop_auto_send(show_message=False)
+            self.stop_list_send(show_message=False)
             self._pending_send_bytes = 0
             if self.auto_detect_checkbox.isChecked() and not self._manual_closing:
                 self._enter_reconnect_mode()
@@ -873,6 +1285,7 @@ class MainWindow(QMainWindow):
 
     def _update_ui_state(self, is_open: bool) -> None:
         is_auto_sending = self.auto_send_timer.isActive()
+        is_busy_sending = is_auto_sending or self._list_send_active
 
         self.open_button.setEnabled(not is_open)
         self.close_button.setEnabled(is_open)
@@ -883,16 +1296,23 @@ class MainWindow(QMainWindow):
         self.parity_combo.setEnabled(not is_open)
         self.stop_bits_combo.setEnabled(not is_open)
 
-        self.send_button.setEnabled(is_open and not is_auto_sending)
-        self.send_input.setEnabled(is_open and not is_auto_sending)
-        self.hex_send_checkbox.setEnabled(is_open and not is_auto_sending)
-        self.line_ending_combo.setEnabled(is_open and not is_auto_sending and not self.hex_send_checkbox.isChecked())
-        self.at_button.setEnabled(is_open and not is_auto_sending)
-        self.start_timer_button.setEnabled(is_open and not is_auto_sending)
+        self.send_button.setEnabled(is_open and not is_busy_sending)
+        self.send_input.setEnabled(is_open and not is_busy_sending)
+        self.hex_send_checkbox.setEnabled(is_open and not is_busy_sending)
+        self.line_ending_combo.setEnabled(is_open and not is_busy_sending and not self.hex_send_checkbox.isChecked())
+        self.at_button.setEnabled(is_open and not is_busy_sending)
+        self.start_timer_button.setEnabled(is_open and not is_busy_sending)
         self.stop_timer_button.setEnabled(is_auto_sending)
-        self.interval_spin.setEnabled(is_open and not is_auto_sending)
+        self.interval_spin.setEnabled(is_open and not is_busy_sending)
+        self.add_current_to_list_button.setEnabled(not is_busy_sending)
+        self.add_empty_list_row_button.setEnabled(not is_busy_sending)
+        self.delete_list_row_button.setEnabled(not is_busy_sending)
+        self.send_selected_list_button.setEnabled(is_open and not is_busy_sending)
+        self.send_list_table.setEnabled(not is_busy_sending)
+        self.start_list_send_button.setEnabled(is_open and not is_busy_sending)
+        self.stop_list_send_button.setEnabled(self._list_send_active)
 
-        quick_enabled = is_open and not is_auto_sending
+        quick_enabled = is_open and not is_busy_sending
         for quick_checkbox in self.quick_hex_checkboxes:
             quick_checkbox.setEnabled(quick_enabled)
         for quick_input in self.quick_command_inputs:
@@ -901,7 +1321,7 @@ class MainWindow(QMainWindow):
             quick_button.setEnabled(quick_enabled)
 
         if self._send_history:
-            self.history_combo.setEnabled(not is_auto_sending)
+            self.history_combo.setEnabled(not is_busy_sending)
         else:
             self.history_combo.setEnabled(False)
 
@@ -988,6 +1408,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.stop_auto_send(show_message=False)
+        self.stop_list_send(show_message=False)
         self._manual_closing = True
         self._waiting_reconnect = False
         self.reconnect_check_timer.stop()
